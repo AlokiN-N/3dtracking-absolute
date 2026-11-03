@@ -127,14 +127,19 @@ def read_transform_csv(path: Path) -> tuple[dict[int, Pose], dict]:
     return poses, meta
 
 
-def load_scene(root: str | Path, width: int = 1920, height: int = 1080, fps: float = 30.0) -> Scene:
-    """Загружает сцену из каталога с распакованным архивом."""
+def load_scene(root: str | Path, width: int = 1920, height: int = 1080, fps: float = 30.0,
+               require_gt: bool = True) -> Scene:
+    """Загружает сцену из каталога с распакованным архивом.
+
+    require_gt=False — для проверочного набора без трека объекта (только камеры и видео).
+    """
     root = Path(root)
     if not root.is_dir():
         raise FileNotFoundError(f"нет каталога с данными: {root}")
 
-    target, _ = read_transform_csv(root / CSV_GLOB.format(actor=TRACK_ACTOR))
-    if not target:
+    gt_path = root / CSV_GLOB.format(actor=TRACK_ACTOR)
+    target = read_transform_csv(gt_path)[0] if gt_path.exists() else {}
+    if not target and require_gt:
         raise RuntimeError(f"не найдены кадры GT в {root}")
 
     cameras: dict[int, CameraTrack] = {}
