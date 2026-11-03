@@ -8,6 +8,7 @@ import numpy as np, pickle, itertools
 
 DT = 1/30.
 ACC = [400.]
+VSHADOW = [0.0]
 ACCZ = [130.]
 VZ_SIG = [60.]
 class EKF:
@@ -66,7 +67,9 @@ def stacked_update(x, P, Ps, chosen, apply_to=None):
         Hfull = np.hstack([J, np.zeros((2, 3))]); sg = sigma_px(b)**2
         axes = valid_axes(b)   # truncated by frame border -> only the coordinate parallel to that border is reliable
         for ax in axes:
-            zs.append([b['cx'], b['cy']][ax]); hs.append(uv[ax]); Hs.append(Hfull[ax:ax+1]); Rs.append(sg)
+            # вертикаль крупного (близкого) блоба смещена тенью под объектом -> меньше доверия
+            k = (1.0 + VSHADOW[0] * max(0.0, b['h'] - 120.0) / 120.0) if ax == 1 else 1.0
+            zs.append([b['cx'], b['cy']][ax]); hs.append(uv[ax]); Hs.append(Hfull[ax:ax+1]); Rs.append(sg * k * k)
     if not zs: return x, P, 0.
     z = np.array(zs); h = np.array(hs); H = np.vstack(Hs); R = np.diag(Rs)
     S = H @ P @ H.T + R; K = P @ H.T @ np.linalg.inv(S)
@@ -118,11 +121,16 @@ class Track:
 
 class Tracker:
     """Causal multi-camera 3D tracker. step(f, blobs_per_cam) -> (output_xyz or None, centre, n_cams)."""
-    def __init__(s, cams, offset=(800., 0.), gate=16., acc=1500., accz=300., vzsig=150., merge=1.0,
-                 reanchor=True, reanchor_dist=4000., lag=0.4):
+    # Все параметры заданы из физики/статистики, НЕ подобраны по GT:
+    #   acc = 1000 см/с^2 (~1 g) — предел продольного/бокового ускорения дорожной машины;
+    #   accz = 300 см/с^2, vzsig = 150 см/с — наземный объект, вертикальная скорость мала;
+    #   gate = 16 — порог хи-квадрат для 2 степеней свободы (p ~ 0.9997);
+    #   offset = (0, 0), lag = 0 — выход = оценённый центр объекта (ТЗ: «детекция центра объекта»).
+    def __init__(s, cams, offset=(0., 0.), gate=16., acc=1000., accz=300., vzsig=150., merge=1.0,
+                 reanchor=True, reanchor_dist=4000., lag=0.0, pitch_win=0, vshadow=0.0):
         s.cams, s.offset, s.gate, s.merge, s.reanchor, s.reanchor_dist = cams, offset, gate, merge, reanchor, reanchor_dist
         ACC[0] = acc; ACCZ[0] = accz; VZ_SIG[0] = vzsig
-        s.lag = lag; s.tracks = []; s.cur = None; s.heading = np.array([1., 0, 0])
+        VSHADOW[0] = vshadow; s.lag = lag; s.pitch_win = pitch_win; s.hist = []; s.tracks = []; s.cur = None; s.heading = np.array([1., 0, 0])
     def step(s, f, raw_blobs):
         cams, gate = s.cams, s.gate
         Ps = [c.P(f) for c in cams]
@@ -171,9 +179,18 @@ class Tracker:
         v = cur.ekf.x[3:5]; sp = np.linalg.norm(v)
         if sp > 150: s.heading = np.r_[v/sp, 0]
         c = cur.ekf.x[:3].copy()
-        # model pivot = visual centre + (half-length L + estimation lag tau * speed) along heading
+        # наклон по уклону: по собственной траектории за последние кадры (только прошлое)
+        s.hist.append(c)
+        if len(s.hist) > s.pitch_win: s.hist.pop(0)
+        pitch = 0.0
+        if s.pitch_win and len(s.hist) >= s.pitch_win:
+            dxy = np.linalg.norm(s.hist[-1][:2] - s.hist[0][:2])
+            if dxy > 300: pitch = float(np.arctan2(s.hist[-1][2] - s.hist[0][2], dxy))
+        s.pitch = 0.8 * getattr(s, 'pitch', 0.0) + 0.2 * pitch
+        # точка привязки = центр + (L + tau*v) вдоль курса с учётом наклона
         along = s.offset[0] + s.lag*sp
-        return c + along*s.heading + np.array([0, 0, s.offset[1]]), c, cur.used
+        d = np.r_[s.heading[:2] * np.cos(s.pitch), np.sin(s.pitch)]
+        return c + along*d + np.array([0, 0, s.offset[1]]), c, cur.used
 
 def run(det, cams, nframes, **kw):
     tr = Tracker(cams, **kw)
