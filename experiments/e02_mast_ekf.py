@@ -153,7 +153,7 @@ class MaSTEKF(Experiment):
 
     def __init__(self, init: str | None = None, model: str = "MaST_tiny", tau_track: float = 0.30,
                  tau_reacq: float = 0.45, gate: float = 25.0, probation: int = 15,
-                 anchor_fwd_cm: float = 460.0, anchor_up_cm: float = -60.0, motion_backup: bool = False,
+                 anchor_fwd_cm: float = 0.0, anchor_up_cm: float = 0.0, motion_backup: bool = False,
                  blob_back_cm: float = 350.0, lag_s: float = 0.0, **_) -> None:
         self.init_path = init
         self.model = model
@@ -162,9 +162,8 @@ class MaSTEKF(Experiment):
         self.gate = gate
         self.probation_len = probation
         self.obj = ObjectModel()
-        # смещение «центр рамки MaST -> точка привязки GT» (вперёд по курсу, вверх), см.
-        # ObjectModel даёт (1000, -200) от центра бокса; рамка MaST стягивается к кабине,
-        # поэтому сдвиг откалиброван на Way1 по медиане ошибки вдоль курса (см. README).
+        # смещение «центр объекта -> выходная точка» (вперёд по курсу, вверх), см.
+        # По умолчанию 0: выход = центр объекта; по GT ничего не подбирается.
         self.anchor_fwd_cm, self.anchor_up_cm = anchor_fwd_cm, anchor_up_cm
         self.motion_backup = motion_backup
         self.lag_s = lag_s   # компенсация запаздывания оценки: + lag_s * скорость

@@ -6,8 +6,8 @@
    рамки блоба в каждой камере, поэтому работает при 1..N видящих камерах;
    совместная ассоциация блобов по камерам, несколько гипотез, перепривязка
    при дрейфе, у обрезанных краем кадра рамок — только надёжная координата.
-3. Точка привязки GT: центр + (L + tau*v) по курсу (L~половина длины, tau —
-   запаздывание оценки).
+3. Выход — оценённый 3D-центр объекта. Никакие параметры не подбираются по GT:
+   смещение до другой точки объекта можно задать только из его 3D-модели (offset_cm).
 
 Строго причинно: кадр t использует только кадры <= t.
 """
@@ -32,7 +32,7 @@ from experiments.bgsub_ekf.fuse import Tracker
 class BgSubEKF(Experiment):
     name = "e01_bgsub_ekf"
 
-    def __init__(self, offset_cm: float = 800.0, lag_s: float = 0.4, video_offset: int = 0, **_) -> None:
+    def __init__(self, offset_cm: float = 0.0, lag_s: float = 0.0, video_offset: int = 0, **_) -> None:
         self.offset_cm = float(offset_cm)
         self.lag_s = float(lag_s)
         self.video_offset = int(video_offset)
