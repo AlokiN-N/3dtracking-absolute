@@ -99,7 +99,7 @@ def compatible_rays(first, second, size):
 
 
 class ConsensusTracker:
-    def __init__(self, segmenter, model, fps, camera_count):
+    def __init__(self, segmenter, model, fps, camera_count, video_masks=None):
         self.segmenter = segmenter
         self.model = model
         self.fps = fps
@@ -111,6 +111,9 @@ class ConsensusTracker:
         self.last_seen = -1
         self.last_multi = -1
         self.masks = {}
+        self.video_masks = video_masks
+        self.image_tracks = {}
+        self.mask_horizon = max(1, round(2.5 * fps))
         self.reverse_streak = 0
         self.search_period = max(1, round(fps / 3))
 
@@ -153,6 +156,30 @@ class ConsensusTracker:
             if instances:
                 observations[key] = [Observation(View.of(view.camera, item, self.model)) for item in instances]
         return observations
+
+    def track_image_masks(self, estimate, cameras, images):
+        self.video_masks.discard_missing(self.frame, cameras.keys() & self.image_tracks.keys())
+        tracks = {}
+        for key in cameras:
+            image = images[key]
+            detection = estimate.views.get(key)
+            if detection is not None and not detection.flow:
+                tracks[key] = self.frame, image, detection
+                self.video_masks.sessions.pop(key, None)
+                continue
+            previous = self.image_tracks.get(key)
+            if previous is None:
+                continue
+            last_detection, previous_image, previous_mask = previous
+            if self.frame - last_detection > self.mask_horizon or image.shape != previous_image.shape:
+                continue
+            if key not in self.video_masks.sessions:
+                self.video_masks.step(self.frame - 1, key, previous_image, previous_mask)
+            mask = self.video_masks.step(self.frame, key, image, None)
+            if mask is not None and box_overlap(mask.box, previous_mask.box) >= 0.45:
+                tracks[key] = last_detection, image, mask
+                estimate.tracked_2d[key] = mask
+        self.image_tracks = tracks
 
     @staticmethod
     def support(pose, groups, threshold):
@@ -218,6 +245,12 @@ class ConsensusTracker:
         return (best[1], best[2]) if best else (None, [])
 
     def step(self, frame, cameras, images):
+        estimate = self.estimate_pose(frame, cameras, images)
+        if self.video_masks is not None:
+            self.track_image_masks(estimate, cameras, images)
+        return estimate
+
+    def estimate_pose(self, frame, cameras, images):
         if frame != self.frame + 1:
             raise ValueError("Expected consecutive frame numbers")
         self.frame = frame

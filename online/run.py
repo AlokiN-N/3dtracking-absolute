@@ -97,11 +97,13 @@ def seed_box(value):
 
 def draw(img, key, camera, estimate, model=DEFAULT_TARGET, view=None):
     out = cv2.resize(img, (480, 270), interpolation=cv2.INTER_AREA)
-    item = estimate.views.get(key)
+    tracked = estimate.tracked_2d.get(key)
+    item = tracked or estimate.views.get(key)
     if item is not None:
         contour = item.contour
         contour = np.round(contour * [480/img.shape[1], 270/img.shape[0]]).astype(np.int32)
-        cv2.polylines(out, [contour], True, (240, 199, 126) if item.source == "motion" else (83, 240, 136), 1, cv2.LINE_AA)
+        color = (240, 155, 214) if tracked else ((240, 199, 126) if item.source == "motion" else (83, 240, 136))
+        cv2.polylines(out, [contour], True, color, 1, cv2.LINE_AA)
     if camera is not None and estimate.pose is not None:
         box = (view if view is not None else View.of(camera, model=model)).box(estimate.pose)
         if intersects(box, img.shape[1], img.shape[0]):
@@ -110,7 +112,8 @@ def draw(img, key, camera, estimate, model=DEFAULT_TARGET, view=None):
             color = (83, 240, 136) if key in estimate.views else (47, 182, 251)
             cv2.rectangle(out, tuple(box[:2]), tuple(box[2:]), color, 1, cv2.LINE_AA)
     cv2.rectangle(out, (0, 0), (480, 22), (31, 23, 19), -1)
-    cv2.putText(out, f"CAM {key:02d}  |  " + ("OBSERVED" if key in estimate.views else "NO OBSERVATION"),
+    status = "TRACKED 2D" if tracked else ("OBSERVED" if key in estimate.views else "NO OBSERVATION")
+    cv2.putText(out, f"CAM {key:02d}  |  {status}",
                 (9, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (235, 240, 247), 1, cv2.LINE_AA)
     return out
 
@@ -180,12 +183,7 @@ def run(args):
         if not protected and len(aligned) != len(caps):
             raise ValueError("Camera frame rates differ")
         length = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cap in aligned.values())
-    video_masks = None
-    if args.global_seg is not None:
-        from online.estimation.consensus import ConsensusTracker, GlobalSegmenter
-
-        tracker = ConsensusTracker(GlobalSegmenter(args.global_seg, model.labels), model, fps, len(tracks))
-    else:
+    if args.global_seg is None:
         if sys.platform == "win32" and (args.pico_source is not None or modern or args.cab_ray is not None):
             import torch  # Load PyTorch's cuDNN before ONNX Runtime on Windows.
         segmenter = Segmenter(args.model, args.threads, labels=model.labels,
@@ -194,10 +192,17 @@ def run(args):
         print("YOLO providers:", segmenter.model.get_providers(), flush=True)
         if prompt is not None:
             print("SAM providers:", prompt.model.enc.get_providers(), flush=True)
-        if args.sam_video is not None:
-            from online.perception.video_masks import VideoMasks
+    video_masks = None
+    if args.sam_video is not None:
+        from online.perception.video_masks import VideoMasks
 
-            video_masks = VideoMasks(args.sam_video, revision=args.sam_video_revision)
+        video_masks = VideoMasks(args.sam_video, revision=args.sam_video_revision)
+    if args.global_seg is not None:
+        from online.estimation.consensus import ConsensusTracker, GlobalSegmenter
+
+        tracker = ConsensusTracker(GlobalSegmenter(args.global_seg, model.labels), model, fps, len(tracks),
+                                   video_masks=video_masks)
+    else:
         tracker = Tracker(segmenter, fps, args.cadence, prompt, model, seed_boxes,
                           robust=args.robust, adaptive=args.adaptive, video_masks=video_masks)
         tracker.camera_ids.update(tracks)
@@ -339,6 +344,9 @@ def run(args):
             record = {"frame": frame, "xyz": xyz, "status": estimate.status,
                       "cams": list(estimate.views), "confidence": round(estimate.confidence, 3),
                       "speed_mps": speed_mps, "speed_kmh": speed_kmh}
+            if estimate.tracked_2d:
+                record["tracked_2d_boxes"] = {key: item.box.round(1).tolist()
+                                              for key, item in estimate.tracked_2d.items()}
             if args.joint_pose:
                 record["joint_applied"] = refiner.joint_applied
             if mono_depth is not None:
@@ -467,7 +475,7 @@ def main():
                           args.appearance_target, args.joint_pose, args.joint_motion_check, args.joint_spatial_check,
                           args.recover_second_view, args.mono_depth, args.surface_pose, args.guard_flow_jumps,
                           args.cab_ray, args.cab_ray_always, args.gotrack_source, args.roma_source, args.tapnext_source,
-                          args.gotrack_checkpoint, args.tapnext_checkpoint, args.sam_video, args.unified,
+                          args.gotrack_checkpoint, args.tapnext_checkpoint, args.unified,
                           args.robust, args.adaptive)
         if not args.global_seg.is_file():
             parser.error("--global-seg requires a local segmentation checkpoint")

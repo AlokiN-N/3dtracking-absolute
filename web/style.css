@@ -59,6 +59,7 @@ video.way2 { aspect-ratio: 16 / 9; }
 .legend i { margin-right: 5px; }
 .legend .amber { background: var(--amber); }
 .legend .cyan { background: var(--cyan); }
+.legend .violet { background: #d69bf0; }
 .legend .orange { background: var(--orange); }
 .lag-text { color: var(--orange); }
 .frame { color: var(--muted); }

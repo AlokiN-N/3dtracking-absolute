@@ -34,6 +34,7 @@ class Estimate:
     status: str
     views: dict
     confidence: float
+    tracked_2d: dict = field(default_factory=dict)
 
 
 def box_overlap(a, b):

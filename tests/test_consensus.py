@@ -29,6 +29,23 @@ class Detector:
         return {}
 
 
+class MaskMemory:
+    def __init__(self):
+        self.sessions = {}
+
+    def discard_missing(self, frame, keys):
+        self.sessions = {key: item for key, item in self.sessions.items()
+                         if key in keys and item[0] == frame - 1}
+
+    def step(self, frame, key, image, seed):
+        if seed is None:
+            previous_frame, seed = self.sessions[key]
+            if frame != previous_frame + 1:
+                raise AssertionError("Video mask skipped a frame")
+        self.sessions[key] = frame, seed
+        return seed
+
+
 class ConsensusTests(unittest.TestCase):
     def test_unverified_pose_is_not_carried_into_next_frame(self):
         model = DEFAULT_TARGET
@@ -61,6 +78,20 @@ class ConsensusTests(unittest.TestCase):
             tracker.step(frame, cameras, images)
         detector.detections = {1: masks[1]}
         self.assertIsNone(tracker.step(34, cameras, images).pose)
+
+        # A continued 2D mask remains available even after the 3D pose expires.
+        memory = MaskMemory()
+        tracker = ConsensusTracker(detector, model, 30, len(cameras), video_masks=memory)
+        detector.detections = masks
+        self.assertEqual(tracker.step(0, cameras, images).status, "multi")
+        detector.detections = {}
+        for frame in range(1, 33):
+            carried = tracker.step(frame, {2: cameras[2]}, {2: images[2]})
+            self.assertNotIn(2, carried.views)
+            self.assertIn(2, carried.tracked_2d)
+        self.assertIsNone(carried.pose)
+        self.assertEqual(tracker.last_seen, 0)
+        self.assertNotIn(1, memory.sessions)
 
     def test_acquires_a_free_rigid_object_from_two_calibrated_views(self):
         body = np.array(list(product((-2.0, 2.0), (-0.8, 0.8), (-0.6, 0.6))))

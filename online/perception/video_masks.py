@@ -12,8 +12,11 @@ class VideoMasks:
 
         self.torch = torch
         self.device = device
-        if revision is None and checkpoint == "facebook/sam2.1-hiera-tiny":
-            revision = "de431c4043854a71d8101e17995dfe596bf101a5"
+        if revision is None:
+            revision = {
+                "facebook/sam2.1-hiera-tiny": "de431c4043854a71d8101e17995dfe596bf101a5",
+                "facebook/sam2.1-hiera-base-plus": "b7320756a13354e7530a63935656d35b2f91a290",
+            }.get(checkpoint)
         self.model = Sam2VideoModel.from_pretrained(checkpoint, revision=revision).to(device).eval()
         self.processor = Sam2VideoProcessor.from_pretrained(checkpoint, revision=revision)
         self.revision = getattr(self.model.config, "_commit_hash", revision)

@@ -168,7 +168,9 @@ function paint(frame) {
     : `Скорость · ≈ ${integer.format(Math.round(point.speed_kmh))} км/ч`;
   const cams = point.cams.length ? `Камеры ${point.cams.join(", ")}` : "Без зрительного наблюдения";
   const error = point.error_m == null ? "" : ` · ошибка ${number.format(point.error_m)} м`;
-  byId("detail").textContent = cams + error;
+  const imageCams = Object.keys(point.tracked_2d_boxes ?? {});
+  const tracking = imageCams.length ? ` · 2D-сопровождение: камеры ${imageCams.join(", ")}` : "";
+  byId("detail").textContent = cams + error + tracking;
   if (lag) {
     const delayed = lag.frames[index - lag.k];
     const position = delayed?.xyz[0] != null ? delayed.xyz.map(x => number.format(x / 100)).join(" / ") : "—";
@@ -357,6 +359,7 @@ const replay = fetch("replay.json").then(response => {
 replay.then(payload => {
   data = payload;
   frames = data.frames;
+  byId("mask-track-legend").hidden = !frames.some(frame => frame.tracked_2d_boxes);
   const hasSpeed = frames.some(frame => "speed_kmh" in frame);
   byId("speed").hidden = !hasSpeed;
   document.querySelector('[data-axis="speed"]').hidden = !hasSpeed;
