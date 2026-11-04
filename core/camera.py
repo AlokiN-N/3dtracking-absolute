@@ -19,6 +19,7 @@ class Camera:
     sensor_mm: tuple[float, float]
     width: int
     height: int
+    intrinsics_px: tuple[float, float, float, float] | None = None
 
     # ---------------------------------------------------------------- базис
     @property
@@ -40,23 +41,32 @@ class Camera:
             sensor_mm=track.sensor_mm,
             width=width,
             height=height,
+            intrinsics_px=track.intrinsics_px,
         )
 
     # ---------------------------------------------------------- интринсики
     @property
     def fx(self) -> float:
+        if self.intrinsics_px is not None:
+            return self.intrinsics_px[0]
         return self.width * self.focal_mm / self.sensor_mm[0]
 
     @property
     def fy(self) -> float:
+        if self.intrinsics_px is not None:
+            return self.intrinsics_px[1]
         return self.height * self.focal_mm / self.sensor_mm[1]
 
     @property
     def cx(self) -> float:
+        if self.intrinsics_px is not None:
+            return self.intrinsics_px[2]
         return self.width / 2.0
 
     @property
     def cy(self) -> float:
+        if self.intrinsics_px is not None:
+            return self.intrinsics_px[3]
         return self.height / 2.0
 
     @property

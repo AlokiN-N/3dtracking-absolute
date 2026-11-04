@@ -18,7 +18,7 @@ Y вправо, Z вверх), углы в градусах. Во второй �
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +48,7 @@ class CameraTrack:
     sensor_mm: tuple[float, float]
     poses: dict[int, Pose]
     video: Path | None = None
+    intrinsics_px: tuple[float, float, float, float] | None = None
 
     @property
     def name(self) -> str:

@@ -1,0 +1,16 @@
+{
+  "python": "3.13.5 (main, Jul 15 2026, 20:25:40) [GCC 14.2.0]",
+  "packages": {
+    "numpy": "2.5.4",
+    "scipy": "1.18.1",
+    "onnxruntime-gpu": "1.31.1",
+    "opencv-python-headless": "5.0.0.93",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "transformers": "5.22.1",
+    "gtsam": "4.3.0",
+    "pytorch3d": "0.7.9",
+    "blenderproc": "2.8.0"
+  },
+  "sam2_revision": "de431c4043854a71d8101e17995dfe596bf101a5"
+}

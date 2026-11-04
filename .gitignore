@@ -5,3 +5,8 @@ out/
 __pycache__/
 *.pyc
 models/
+vendor/
+runtime/
+.cache/
+.venv-*/
+configs/*.local.json

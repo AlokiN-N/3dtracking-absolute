@@ -1,0 +1,38 @@
+[
+  {
+    "name": "gotrack",
+    "repository": "https://github.com/facebookresearch/gotrack.git",
+    "commit": "68f76055755f2a4a8967e13ece834f975f008bdf",
+    "weights": {
+      "file": "vendor/gotrack/gotrack_checkpoint.pt",
+      "url": "https://media.githubusercontent.com/media/facebookresearch/gotrack/68f76055755f2a4a8967e13ece834f975f008bdf/gotrack_checkpoint.pt",
+      "sha256": "f7d127abe2b8e37b1322a19115343286a6560700c6e02fc6080b4e2426a01086"
+    }
+  },
+  {
+    "name": "romav2",
+    "repository": "https://github.com/Parskatt/RoMaV2.git",
+    "commit": "95c9968145c8906b7b59383258e9f73b02853d89",
+    "weights": {
+      "file": "vendor/romav2.0.1.pt",
+      "url": "https://github.com/Parskatt/RoMaV2/releases/download/v2.0.1/romav2.0.1.pt",
+      "sha256": "1557dec0d21b62366465f7ff4d5fdf228cc695d0582e196ad2b80e05230828b7",
+      "cache_file": "cache/torch-cache/hub/checkpoints/romav2.0.1.pt"
+    }
+  },
+  {
+    "name": "tapnet",
+    "repository": "https://github.com/google-deepmind/tapnet.git",
+    "commit": "ceedd60bb9f6c9f7c74796e4445aff6c6ddf7c9b",
+    "weights": {
+      "file": "vendor/tapnext_ckpt.npz",
+      "url": "https://storage.googleapis.com/dm-tapnet/tapnext/tapnext_ckpt.npz",
+      "sha256": "7446dcec47ee561868a5cfbf3b306eb768a86d2e93680ad72eaa4cd04df73d5f"
+    }
+  },
+  {
+    "name": "dinov2",
+    "repository": "https://github.com/facebookresearch/dinov2.git",
+    "commit": "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
+  }
+]
