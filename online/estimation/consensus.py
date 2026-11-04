@@ -4,7 +4,7 @@ from itertools import combinations
 import cv2
 import numpy as np
 
-from online.geometry import Observation, View, angle_diff, center_of, fit, intersects, optimize, with_center
+from online.geometry import Observation, View, angle_diff, center_of, fit, intersects, linear_seed, optimize, with_center
 from online.perception.vision import Instance, transport
 from online.tracker import Estimate, box_overlap
 
@@ -114,6 +114,10 @@ class ConsensusTracker:
         self.video_masks = video_masks
         self.image_tracks = {}
         self.mask_horizon = max(1, round(2.5 * fps))
+        self.mask_pose = None
+        self.mask_velocity = np.zeros(3)
+        self.mask_frame = -1
+        self.previous_output = None
         self.reverse_streak = 0
         self.search_period = max(1, round(fps / 3))
 
@@ -248,6 +252,64 @@ class ConsensusTracker:
         estimate = self.estimate_pose(frame, cameras, images)
         if self.video_masks is not None:
             self.track_image_masks(estimate, cameras, images)
+            estimate = self.recover_mask_pose(estimate)
+            self.previous_output = estimate.pose
+        return estimate
+
+    def recover_mask_pose(self, estimate):
+        if estimate.views:
+            self.mask_pose = estimate.pose.copy()
+            self.mask_velocity = self.velocity.copy()
+            self.mask_frame = self.frame
+            return estimate
+        gap = self.frame - self.mask_frame
+        if self.mask_pose is None or gap > max(1, round(self.fps / 2)):
+            return estimate
+        observations = [Observation(View.of(self.current_views[key].camera, mask, self.model))
+                        for key, mask in estimate.tracked_2d.items()]
+        prior = self.mask_pose.copy()
+        prior[:3] += gap * self.mask_velocity
+        best = None
+        for a, b in combinations(observations, 2):
+            if a.clipped or b.clipped or not compatible_rays(a, b, self.model.size):
+                continue
+            pair = [a, b]
+            poses = []
+            if self.model.ground_vehicle:
+                sigma = max(0.6, 0.10 * self.model.size)
+                seeds = [prior]
+                center = linear_seed(pair)
+                if center is not None:
+                    seeds.append(with_center(prior, center, self.model))
+                poses = [optimize(pair, seed, prior, prior[3], prior[4], [sigma] * 3,
+                                  yaw_window=0.35, model=self.model)[0] for seed in seeds]
+            else:
+                poses = [fit(pair, prior, 0.0, 0.0, 0, 0.8)[0]]
+            limit = max(1.0, 1.5 * gap * self.model.speed / self.fps)
+            for pose in poses:
+                overlap = [ob.overlap(pose) for ob in pair]
+                score = min(overlap)
+                weak_view = score < 0.52
+                if weak_view and (score < 0.42 or max(overlap) < 0.62):
+                    continue
+                if np.linalg.norm(center_of(pose, self.model) - center_of(prior, self.model)) > limit:
+                    continue
+                if best is None or score > best[0]:
+                    best = score, pose, pair
+        if best is None:
+            return estimate
+        score, pose, pair = best
+        velocity = (center_of(pose, self.model) - center_of(self.mask_pose, self.model)) / gap
+        self.mask_velocity += 0.25 * (velocity - self.mask_velocity)
+        speed_limit = self.model.speed / self.fps
+        self.mask_velocity *= min(1, speed_limit / max(np.linalg.norm(self.mask_velocity), 1e-9))
+        self.mask_pose, self.mask_frame = pose, self.frame
+        if estimate.pose is None:
+            if self.previous_output is not None and np.linalg.norm(
+                    pose[:3] - self.previous_output[:3]) > max(1.5, 2 * speed_limit):
+                return estimate
+            views = {ob.view.camera.index: ob.view.instance for ob in pair}
+            return Estimate(pose, "mask_multi", views, score, estimate.tracked_2d)
         return estimate
 
     def estimate_pose(self, frame, cameras, images):

@@ -13,7 +13,7 @@ const integer = new Intl.NumberFormat("ru-RU");
 const green = "#86f0b4";
 const orange = "#ff8f53";
 const muted = "#a5b3c2";
-const names = {multi: "Триангуляция", mono: "Одна камера", motion: "Движение и рёбра", flow: "Оптический поток", forecast: "Прогноз", lost: "Потеря"};
+const names = {multi: "Триангуляция", mask_multi: "3D по сопровождению масок", mono: "Одна камера", motion: "Движение и рёбра", flow: "Оптический поток", forecast: "Прогноз", lost: "Потеря"};
 const pad = {left: 51, right: 16, top: 13, bottom: 23};
 let data;
 let frames;
@@ -383,8 +383,10 @@ replay.then(payload => {
   }
   const predicted = frames.filter(frame => frame.xyz[0] !== null).length;
   const observed = frames.filter(frame => frame.cams.length > 0).length;
+  const recovered = frames.filter(frame => frame.status === "mask_multi").length;
   byId("coverage").textContent = number.format(100 * predicted / frames.length) + "%";
   byId("covered").textContent = `${integer.format(predicted)} из ${integer.format(frames.length)} кадров`;
+  if (recovered) byId("covered").textContent += ` · ${integer.format(recovered)} восстановлено по двум маскам`;
   byId("observed").textContent = number.format(100 * observed / frames.length) + "%";
   byId("run-info").textContent = `${metadata.cameras} камер · ${number.format(metadata.fps)} кадр/с в исходнике · ${number.format(metadata.mean_ms)} мс на шаг трекера`;
   paint(0);

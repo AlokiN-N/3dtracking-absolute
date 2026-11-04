@@ -93,6 +93,22 @@ class ConsensusTests(unittest.TestCase):
         self.assertEqual(tracker.last_seen, 0)
         self.assertNotIn(1, memory.sessions)
 
+        memory = MaskMemory()
+        tracker = ConsensusTracker(detector, model, 30, len(cameras), video_masks=memory)
+        detector.detections = masks
+        self.assertEqual(tracker.step(0, cameras, images).status, "multi")
+        detector.detections = {}
+        for frame in range(1, 31):
+            self.assertEqual(tracker.step(frame, cameras, images).status, "forecast")
+        tracker.previous_output = tracker.previous_output + np.array([15., 0., 0., 0., 0.])
+        self.assertIsNone(tracker.step(31, cameras, images).pose)
+        recovered = tracker.step(32, cameras, images)
+        self.assertEqual(recovered.status, "mask_multi")
+        self.assertEqual(set(recovered.views), {1, 2})
+        np.testing.assert_allclose(center_of(recovered.pose, model), center_of(truth, model), atol=1.0)
+        self.assertEqual(tracker.last_seen, 0)
+        self.assertIsNone(tracker.step(33, {2: cameras[2]}, {2: images[2]}).pose)
+
     def test_acquires_a_free_rigid_object_from_two_calibrated_views(self):
         body = np.array(list(product((-2.0, 2.0), (-0.8, 0.8), (-0.6, 0.6))))
         appendage = np.array(list(product((0.2, 1.4), (0.4, 1.2), (0.5, 1.0))))

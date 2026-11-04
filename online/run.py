@@ -329,7 +329,7 @@ def run(args):
             processing.append(time.perf_counter() - start)
             xyz = [round(float(x) * 100, 4) for x in estimate.pose[:3]] if estimate.pose is not None else [None] * 3
             center = (center_of(estimate.pose, model)
-                      if estimate.pose is not None and estimate.status not in {"forecast", "flow"} else None)
+                      if estimate.pose is not None and estimate.status not in {"forecast", "flow", "mask_multi"} else None)
             speed = speed_meter.step(frame, center)
             speed_mps = round(speed, 4) if speed is not None else None
             speed_kmh = round(speed * 3.6, 3) if speed is not None else None
