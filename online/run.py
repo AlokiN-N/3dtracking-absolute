@@ -6,6 +6,7 @@ import csv
 import json
 from pathlib import Path
 import re
+import sys
 import time
 
 import cv2
@@ -139,6 +140,10 @@ def run(args):
         raise ValueError("--joint-pose needs PicoPose")
     if args.recover_second_view and args.pico_source is None:
         raise ValueError("--recover-second-view needs PicoPose")
+    if args.cab_ray_always and args.cab_ray is None:
+        raise ValueError("--cab-ray-always needs --cab-ray")
+    if args.cab_ray is not None and (not model.labels or not args.cab_ray.is_file()):
+        raise ValueError("--cab-ray needs local YOLO weights and target detector labels")
     if (args.joint_motion_check or args.joint_spatial_check) and not args.joint_pose:
         raise ValueError("--joint-motion-check and --joint-spatial-check need --joint-pose")
     appearance = load_target(args.appearance_target) if args.appearance_target is not None else model
@@ -160,9 +165,8 @@ def run(args):
     if not protected and len(aligned) != len(caps):
         raise ValueError("Camera frame rates differ")
     counts = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cap in aligned.values()]
-    if args.pico_source is not None or modern or args.cab_ray is not None:
-        # Windows: cuDNN из PyTorch загружается раньше пакета nvidia-cudnn для ONNX Runtime, иначе DLL конфликтуют
-        import torch  # noqa: F401
+    if sys.platform == "win32" and (args.pico_source is not None or modern or args.cab_ray is not None):
+        import torch  # Load PyTorch's cuDNN before ONNX Runtime on Windows.
     segmenter = Segmenter(args.model, args.threads, labels=model.labels,
                           exclude=(0,) if model.ground_vehicle else ())
     prompt = PromptSegmenter(args.sam, args.threads) if args.sam is not None else None
@@ -266,11 +270,6 @@ def run(args):
                 checked = flow_jump_guard.step(estimate.pose, estimate.status, estimate.confidence, estimate.views, views)
                 flow_jump_changed = checked is not estimate.pose
                 estimate.pose = checked
-            if cab_ray is not None and estimate.pose is not None:
-                corrected = cab_ray.step(estimate.pose, estimate.status, estimate.views, cameras, images)
-                # поправляем только ответ: если сдвигать и состояние трекера, выходной фильтр потом
-                # долго сходится к многокамерной оценке (Way1, кадры 0–134: 1.61 м против 1.77–2.02 м)
-                estimate.pose = corrected
             if args.recover_second_view:
                 previous = previous_recovery_baseline
                 previous_recovery_baseline = estimate.pose
@@ -292,6 +291,11 @@ def run(args):
                     estimate.status = "multi" if len(estimate.views) > 1 else "mono"
                 if args.unified and estimate.pose is not None and measurement is not None:
                     tracker.accept_measurement(estimate.pose, pipeline.state.velocity)
+            if cab_ray is not None:
+                ray_views = {key: view for key, view in tracker.current_views.items()
+                             if tracker.camera_health.get(key) != "outlier"}
+                # Refine only the emitted pose, after every stateful update.
+                estimate.pose = cab_ray.step(estimate.pose, estimate.status, estimate.views, ray_views, images)
             processing.append(time.perf_counter() - start)
             xyz = [round(float(x) * 100, 4) for x in estimate.pose[:3]] if estimate.pose is not None else [None] * 3
             table.writerow([frame, *xyz])
@@ -390,7 +394,7 @@ def main():
     parser.add_argument("--mono-depth", action="store_true", help="Carry verified depth through short single-camera intervals")
     parser.add_argument("--surface-pose", action="store_true", help="Refine pose from causal tracks attached to the CAD surface")
     parser.add_argument("--guard-flow-jumps", action="store_true", help="Reject implausible jumps without fresh detections")
-    parser.add_argument("--cab-ray", type=Path, help="YOLO weights (e.g. yolo26l.pt): ray to the cab from cameras without a mask")
+    parser.add_argument("--cab-ray", type=Path, help="Local YOLO weights for an extra ray to the target or its reference part")
     parser.add_argument("--cab-ray-always", action="store_true",
                         help="keep the cab ray after the first multi-camera fix (default: only before it)")
     parser.add_argument("--renderer", choices=("numpy", "pytorch3d"), default="numpy", help="Visible CAD rasterizer for GoTrack")

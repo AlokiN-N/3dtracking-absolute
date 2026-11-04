@@ -45,7 +45,7 @@ weights = {}
 sources = {}
 for index, argument in enumerate(tracker_args[:-1]):
     value = Path(tracker_args[index + 1])
-    if argument.endswith("-checkpoint") and value.is_file():
+    if (argument.endswith("-checkpoint") or argument == "--cab-ray") and value.is_file():
         with value.open("rb") as stream:
             weights[str(value.resolve())] = hashlib.file_digest(stream, "sha256").hexdigest()
     if argument.endswith("-source") and (value/".git").exists():

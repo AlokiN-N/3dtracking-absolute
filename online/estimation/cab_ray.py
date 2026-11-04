@@ -1,24 +1,7 @@
-"""Луч на кабину: дополнительный ракурс, когда объект видит одна камера (или ни одной).
-
-Белый прицеп на снегу детектор и SAM часто не видят, а кабину крупная YOLO находит
-(камера 5, кадры 0–19 Way1: YOLO26l — «truck 0.29» ровно по кабине). Кабина и есть точка-ответ,
-поэтому луч из такой камеры через центр найденной кабины — сильное измерение.
-
-На каждом кадре со статусом mono/forecast/motion/flow:
-1. для камер без наблюдения модель ставится в текущую позу, проецируется кабина и вся машина;
-2. в окне вокруг ожидаемой машины YOLO ищет транспорт размером с кабину рядом с её проекцией;
-3. поза поправляется взвешенным МНК: старая оценка точна поперёк луча своей камеры и неточна
-   вдоль (дальность), новая камера даёт луч на центр кабины с точностью в несколько пикселей.
-Используются только текущий кадр и состояние трекера — режим остаётся причинным.
-
-По умолчанию луч работает только до первой многокамерной засечки: пока дальность известна лишь по
-одной камере, луч — единственный второй ракурс (Way1, кадры 0–21: 5.32 → 0.81 м). Позже дальность держит
-модель движения, а дальние кабины на камерах 3–4 YOLO путает: поправки 7–11 м с подъёмом на 2 м
-(Way1, кадры 645–684 и 781–798) портят ответ, в сумме MAE 3.78 → 4.02 м при работе на всём ролике.
-"""
+"""Refine the emitted translation with rays to a visible CAD part at startup."""
 import numpy as np
 
-from online.geometry import Rot, View
+from online.geometry import Rot
 
 VEHICLE_LABELS = (2, 5, 7, 8)  # car, bus, truck, boat — дальнюю кабину YOLO называет по-разному
 EDGE_PX = 3
@@ -30,9 +13,9 @@ class CabRay:
 
         self.detector = YOLO(str(weights))
         self.model = model
-        cab = model.reference_part if model.reference_part is not None else model.vertices
-        self.cab = np.asarray(cab, float)
-        self.cab_center = (self.cab.min(axis=0) + self.cab.max(axis=0)) / 2
+        self.labels = VEHICLE_LABELS if model.ground_vehicle else model.labels
+        self.part = model.reference_part if model.reference_part is not None else model.vertices
+        self.part_center = (self.part.min(axis=0) + self.part.max(axis=0)) / 2
         self.conf, self.imgsz = conf, imgsz
         self.max_shift_m, self.sigma_px = max_shift_m, sigma_px
         self.applied = None  # (камера, сдвиг, м) на последнем кадре — для replay.json
@@ -40,11 +23,11 @@ class CabRay:
         self.seen_multi = False  # была ли уже засечка двумя и более камерами
 
     def detect(self, image, view, pose):
-        """Центр кабины в кадре камеры или None."""
+        """Locate the projected reference part in the current image."""
         truck = view.box(pose)
         R = Rot(*pose[3:])
-        uv, depth = view.project(self.cab @ R.T + pose[:3])
-        if truck is None or depth.min() < 1:
+        uv, depth = view.project(self.part @ R.T + pose[:3])
+        if truck is None or depth.min() < (1 if self.model.ground_vehicle else 0.06):
             return None
         cab = np.r_[uv.min(axis=0), uv.max(axis=0)]
         h, w = image.shape[:2]
@@ -54,7 +37,7 @@ class CabRay:
         center = (truck[:2] + truck[2:]) / 2
         x, y = np.clip(np.round(center - side / 2).astype(int), 0, [w - side, h - side])
         result = self.detector.predict(image[y:y + side, x:x + side], imgsz=self.imgsz, conf=self.conf,
-                                       classes=list(VEHICLE_LABELS), verbose=False)[0]
+                                       classes=list(self.labels), verbose=False)[0]
         cab_size = max(cab[2:] - cab[:2])
         # прогноз по одной камере сдвинут на метры (десятки пикселей) — допуск в размер всей машины
         margin = max(max(truck[2:] - truck[:2]), 30)
@@ -77,8 +60,8 @@ class CabRay:
                 best = value, mid
         return None if best is None else best[1]
 
-    def step(self, pose, status, used, cameras, images):
-        """Поправленная поза (или та же). used — камеры, давшие наблюдение на этом кадре."""
+    def step(self, pose, status, used, views, images):
+        """Return a refined pose without changing the tracker state."""
         self.applied = None
         if len(used) > 1:
             self.seen_multi = True
@@ -87,32 +70,31 @@ class CabRay:
         if pose is None or status not in {"mono", "forecast", "motion", "flow"} or len(used) > 1:
             return pose
         R = Rot(*pose[3:])
-        offset = R @ self.cab_center  # от точки-ответа до центра кабины
+        offset = R @ self.part_center
         p = pose[:3]
         A, b = np.zeros((3, 3)), np.zeros(3)
-        # априорная точность текущей оценки
-        if used:
-            key = next(iter(used))
-            origin = cameras[key].loc / 100
-            ray = (p - origin) / np.linalg.norm(p - origin)
+        primary = views.get(next(iter(used))) if used else None
+        baseline = p - primary.camera.loc / 100 if primary is not None else np.zeros(3)
+        dist = np.linalg.norm(baseline)
+        if dist > 1e-6:
+            ray = baseline / dist
             along = np.outer(ray, ray)
-            dist = np.linalg.norm(p - origin)
             W = along / max(2.0, 0.02 * dist) ** 2 + (np.eye(3) - along) / 0.4**2
         else:
             W = np.eye(3) / 3.0**2
         A += W
         b += W @ p
         rays = []
-        for key, camera in cameras.items():
+        for key, view in views.items():
             if key in used or images.get(key) is None:
                 continue
-            view = View.of(camera, model=self.model)
             mid = self.detect(images[key], view, pose)
             if mid is None:
                 continue
             origin, direction = view.ray(mid)
             dist = np.linalg.norm(p + offset - origin)
-            M = (np.eye(3) - np.outer(direction, direction)) / (dist * self.sigma_px / camera.fpx) ** 2
+            sigma = max(1e-6, dist * self.sigma_px / view.camera.fpx)
+            M = (np.eye(3) - np.outer(direction, direction)) / sigma**2
             # центр кабины x + offset должен лежать на луче: M (x + offset − origin) = 0
             A += M
             b += M @ (origin - offset)
@@ -121,7 +103,7 @@ class CabRay:
             return pose
         x = np.linalg.solve(A, b)
         shift = x - p
-        if np.linalg.norm(shift) > self.max_shift_m:
+        if not np.isfinite(x).all() or np.linalg.norm(shift) > self.max_shift_m:
             return pose
         corrected = pose.copy()
         corrected[:3] = x

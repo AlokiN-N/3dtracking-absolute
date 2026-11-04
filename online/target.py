@@ -39,6 +39,10 @@ class Target:
             raise ValueError("Target speed must be positive in m/s")
         if any(type(label) is not int or label < 0 for label in self.labels):
             raise ValueError("Target labels must be nonnegative detector class IDs")
+        part = self.reference_part
+        if part is not None and (part.ndim != 2 or part.shape[1] != 3 or len(part) < 3
+                                 or not np.isfinite(part).all()):
+            raise ValueError("reference_part must contain at least three finite XYZ vertices")
         object.__setattr__(self, "vertices", vertices)
         object.__setattr__(self, "center", (vertices.min(axis=0) + vertices.max(axis=0)) / 2)
 
@@ -123,7 +127,13 @@ def load_target(path):
         triangles = ((triangles - origin) * scale)[..., axes]
     else:
         parts = [np.asarray(part, dtype=float) for part in spec["parts"]]
+    reference = None
+    if "reference_part" in spec:
+        reference = np.asarray(spec["reference_part"], dtype=float)
+        if reference.ndim != 2 or reference.shape[1] != 3:
+            raise ValueError("reference_part must be an array of XYZ vertices in native CAD units")
+        reference = ((reference - origin) * scale)[:, axes]
     return Target(str(spec.get("name", path.stem)), tuple(((part - origin) * scale)[:, axes] for part in parts),
                   labels=tuple(spec.get("labels", ())), speed=float(spec.get("max_speed_mps", 42)),
                   level_surface=bool(spec.get("level_surface", False)),
-                  triangles=triangles, face_colors=colors)
+                  reference_part=reference, triangles=triangles, face_colors=colors)
