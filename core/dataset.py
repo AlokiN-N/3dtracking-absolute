@@ -1,16 +1,17 @@
 """Чтение датасета: сценарные CSV UE и пути к видео.
 
 Источник данных — экспорт из Unreal Engine: `object_transform_<Actor>.csv`
-(позиция/ориентация актора по кадрам) и `Way1.FinalImage.<Actor>.mp4`.
+(позиция/ориентация актора по кадрам) и `<Scene>.FinalImage.<Actor>.mp4`.
 
 Формат CSV:
     Frame;Loc_X;Loc_Y;Loc_Z;Rot_Roll;Rot_Pitch;Rot_Yaw;;;Focal length;35
     0;-24701.96;6623.57;1200.0;0.0;0.0;-70.0;;;матрица;23,76*13,365мм
     1;...
 
-Разделитель `;`, кодировка CP1251, единицы — сантиметры UE (X вперёд,
+Разделитель `;`, кодировка CP1251 или UTF-8, единицы — сантиметры UE (X вперёд,
 Y вправо, Z вверх), углы в градусах. Во второй строке камеры лежат
 метаданные сенсора (`матрица;23,76*13,365мм`), в первой — фокусное.
+В новом экспорте фокусное находится в столбце `Focal_Length_mm`, размер сенсора — в `matrix_size.txt`.
 
 Данные в git не хранятся: `data/` в .gitignore, архив распаковывается
 локально (см. README).
@@ -18,8 +19,9 @@ Y вправо, Z вверх), углы в градусах. Во второй �
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -49,6 +51,7 @@ class CameraTrack:
     poses: dict[int, Pose]
     video: Path | None = None
     intrinsics_px: tuple[float, float, float, float] | None = None
+    focal_by_frame: dict[int, float] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -92,39 +95,79 @@ def _parse_float(text: str) -> float:
     return float(text.replace(",", ".").replace("\ufeff", "").strip())
 
 
+def _read_text(path):
+    raw = Path(path).read_bytes()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1251", errors="replace")
+
+
+def _sensor_dimensions(text):
+    number = r"(\d+(?:[.,]\d+)?)"
+    match = re.fullmatch(rf"\s*{number}\s*(?:mm|мм)?\s*[*×x]\s*{number}\s*(?:mm|мм)?\s*", text, re.I)
+    if match:
+        size = tuple(map(_parse_float, match.groups()))
+        if min(size) > 0:
+            return size
+    return None
+
+
+def read_sensor_size(root):
+    path = root / "matrix_size.txt"
+    if not path.is_file():
+        return None
+    size = _sensor_dimensions(_read_text(path))
+    if size is None:
+        raise ValueError(f"{path}: expected sensor width and height in millimetres")
+    return size
+
+
 def read_transform_csv(path: Path) -> tuple[dict[int, Pose], dict]:
     """Читает CSV трансформа. Возвращает (кадры, метаданные)."""
     poses: dict[int, Pose] = {}
-    meta: dict = {"focal_mm": None, "sensor_mm": None}
-
-    with open(path, encoding="cp1251", errors="replace") as fh:
-        for lineno, raw in enumerate(fh):
-            fields = _split(raw)
-            if lineno == 0:
-                # шапка: «...;Focal length;35» — ищем по подписи, а не по индексу:
-                # число колонок зависит от наличия пустых полей в конце строки
-                for pos, name in enumerate(fields):
-                    if name.strip() == "Focal length" and pos + 1 < len(fields):
-                        meta["focal_mm"] = _parse_float(fields[pos + 1])
-                continue
-            for field in fields:
-                # строка метаданных сенсора: «матрица;23,76*13,365мм»
-                if "мм" in field and "*" in field:
-                    w, h = field.replace("мм", "").split("*")
-                    meta["sensor_mm"] = (_parse_float(w), _parse_float(h))
-            try:
-                frame = int(fields[0])
-                values = [_parse_float(v) for v in fields[1:7]]
-            except (ValueError, IndexError):
-                continue
-            if len(values) < 3:
-                continue
-            rot = list(values[3:6]) + [0.0] * (3 - len(values[3:6]))
-            poses[frame] = Pose(
-                frame=frame,
-                loc=np.array(values[:3], dtype=np.float64),
-                rot=np.array(rot[:3], dtype=np.float64),
-            )
+    meta: dict = {"focal_mm": None, "sensor_mm": None, "focal_by_frame": {}}
+    focal_column = None
+    columns = None
+    for lineno, raw in enumerate(_read_text(path).splitlines()):
+        fields = _split(raw)
+        if lineno == 0:
+            # шапка: «...;Focal length;35» — ищем по подписи, а не по индексу:
+            # число колонок зависит от наличия пустых полей в конце строки
+            header = {name.strip().casefold(): pos for pos, name in enumerate(fields)}
+            focal_column = header.get("focal_length_mm")
+            names = ("frame", "loc_x", "loc_y", "loc_z", "rot_roll", "rot_pitch", "rot_yaw")
+            if focal_column is not None and all(name in header for name in names):
+                columns = [header[name] for name in names]
+            focal_header = header.get("focal length")
+            if focal_header is not None and focal_header + 1 < len(fields):
+                meta["focal_mm"] = _parse_float(fields[focal_header + 1])
+            continue
+        for field in fields:
+            size = _sensor_dimensions(field)
+            if size is not None:
+                meta["sensor_mm"] = size
+        try:
+            values_fields = fields[:7] if columns is None else [fields[pos] for pos in columns]
+            frame = int(values_fields[0])
+            values = [_parse_float(v) for v in values_fields[1:]]
+            if focal_column is not None:
+                focal = _parse_float(fields[focal_column])
+                if not np.isfinite(focal) or focal <= 0:
+                    continue
+                meta["focal_by_frame"][frame] = focal
+        except (ValueError, IndexError):
+            continue
+        if len(values) < 3:
+            continue
+        rot = list(values[3:6]) + [0.0] * (3 - len(values[3:6]))
+        poses[frame] = Pose(
+            frame=frame,
+            loc=np.array(values[:3], dtype=np.float64),
+            rot=np.array(rot[:3], dtype=np.float64),
+        )
+    if meta["focal_mm"] is None and meta["focal_by_frame"]:
+        meta["focal_mm"] = next(iter(meta["focal_by_frame"].values()))
     return poses, meta
 
 
@@ -144,20 +187,28 @@ def load_scene(root: str | Path, width: int = 1920, height: int = 1080, fps: flo
         raise RuntimeError(f"не найдены кадры GT в {root}")
 
     cameras: dict[int, CameraTrack] = {}
-    for idx in range(1, len(CAMERA_ACTORS) + 1):
-        actor = CAMERA_ACTORS[idx - 1]
-        poses, meta = read_transform_csv(root / CSV_GLOB.format(actor=actor))
+    for path in sorted(root.glob("object_transform_CineCameraActor*.csv")):
+        match = re.fullmatch(r"object_transform_(CineCameraActor(\d+))\.csv", path.name)
+        if match is None:
+            continue
+        actor, number = match.groups()
+        idx = int(number)
+        poses, meta = read_transform_csv(path)
         if not poses:
             continue
-        if meta["focal_mm"] is None or meta["sensor_mm"] is None:
+        sensor = meta["sensor_mm"] or read_sensor_size(root)
+        if meta["focal_mm"] is None or sensor is None:
             raise RuntimeError(f"в {actor} не найдены фокус/сенсор")
-        video = root / VIDEO_GLOB.format(actor=actor)
+        videos = sorted(root.glob(f"*{actor}.mp4"))
+        if len(videos) > 1:
+            raise ValueError(f"{actor}: found multiple matching videos in {root}")
         cameras[idx] = CameraTrack(
             index=idx,
             focal_mm=float(meta["focal_mm"]),
-            sensor_mm=tuple(meta["sensor_mm"]),
+            sensor_mm=sensor,
             poses=poses,
-            video=video if video.exists() else None,
+            video=videos[0] if videos else None,
+            focal_by_frame=meta["focal_by_frame"],
         )
 
     return Scene(root=root, target=target, cameras=cameras, width=width, height=height, fps=fps)

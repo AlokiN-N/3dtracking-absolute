@@ -5,23 +5,42 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#11151b">
 <title>Пеленг · 3D-трекинг</title>
-<link rel="stylesheet" href="style.css">
-<script src="viewer.js" defer></script>
+<link rel="stylesheet" href="/style.css">
+<script src="/viewer.js" defer></script>
 </head>
 <body>
 <main>
   <header>
+    <nav id="scenes" class="downloads" aria-label="Выбор сцены" hidden>
+      <a id="way1-link" href="/">Way1</a>
+      <a id="way2-link" href="/way2/">Way2</a>
+    </nav>
     <div class="eyebrow"><span class="signal"></span> SPACE HACKATHON / <span id="sequence-name">3D TRACKING</span></div>
     <h1 id="target-title">Траектория объекта в 3D</h1>
     <p>Каждый результат вычислен в порядке кадров по синхронным изображениям и состоянию трекера.</p>
+    <p id="quality-note" hidden>Для Way2 доступна проверка точности по отдельным кадрам. Эталонная траектория для всей сцены отсутствует. <a href="quality-samples.json">Данные проверки</a>.</p>
   </header>
-  <section class="metrics" aria-label="Метрики прогона">
-    <article><span>MSE</span><strong id="mse">—</strong><small>Средний квадрат 3D-ошибки</small></article>
-    <article><span>MAE</span><strong id="mae">—</strong><small>Среднее расстояние до эталона</small></article>
-    <article><span>RMSE</span><strong id="rmse">—</strong><small id="rmse-detail">В абсолютной системе координат</small></article>
-    <article><span>Максимум</span><strong id="max-error">—</strong><small>Наибольшая 3D-ошибка</small></article>
-    <article><span>Координаты выданы</span><strong id="coverage">—</strong><small id="covered">Доля кадров видео</small></article>
-    <article><span>Зрительный контакт</span><strong id="observed">—</strong><small>Оценка подтверждена хотя бы одной камерой</small></article>
+  <section id="metrics" aria-labelledby="metrics-title">
+    <div class="section-head">
+      <h2 id="metrics-title">Метрики прогона</h2>
+      <span id="reference-status" class="label" hidden>Для точности по всему ролику нужен эталон</span>
+    </div>
+    <div class="metrics">
+    <article data-reference><span>MSE</span><strong id="mse">—</strong><small>Средний квадрат 3D-ошибки</small></article>
+    <article data-reference><span>MAE</span><strong id="mae">—</strong><small>Среднее расстояние до эталона</small></article>
+    <article data-reference><span>RMSE</span><strong id="rmse">—</strong><small id="rmse-detail">В абсолютной системе координат</small></article>
+    <article data-reference><span>Максимум</span><strong id="max-error">—</strong><small>Наибольшая 3D-ошибка</small></article>
+    <article class="metric-coverage"><span>Координаты выданы</span><strong id="coverage">—</strong><small id="covered">Доля кадров видео</small></article>
+    <article class="metric-coverage"><span>Кадры с наблюдениями</span><strong id="observed">—</strong><small>Трекер использовал данные хотя бы одной камеры</small></article>
+    </div>
+    <div id="sample-metrics" class="card" hidden>
+      <div class="section-head">
+        <h2>Расхождение с независимой оценкой</h2>
+        <span id="sample-count" class="label"></span>
+      </div>
+      <dl id="sample-scores" class="sample-frames"></dl>
+      <div id="sample-frames" class="sample-frames"></div>
+    </div>
   </section>
   <div class="layout">
     <section class="card">
@@ -43,6 +62,7 @@
         <div><dt>Y</dt><dd id="y">—</dd></div>
         <div><dt>Z</dt><dd id="z">—</dd></div>
       </dl>
+      <p id="speed" class="speed" hidden></p>
       <p id="detail" class="quiet">Загрузка результатов</p>
       <canvas id="map" aria-label="Вид траектории сверху в плоскости XY"></canvas>
       <p id="lag-current" class="quiet lag-text" hidden></p>
@@ -53,7 +73,8 @@
       <button type="button" data-axis="0" aria-pressed="true">X</button>
       <button type="button" data-axis="1" aria-pressed="false">Y</button>
       <button type="button" data-axis="2" aria-pressed="false">Z</button>
-      <button type="button" data-axis="error" aria-pressed="false">Ошибка 3D</button>
+      <button type="button" data-axis="speed" aria-pressed="false" hidden>Скорость, км/ч</button>
+      <button type="button" data-axis="error" data-reference aria-pressed="false">Ошибка 3D</button>
     </div></div>
     <form id="lag-controls" class="lag-controls" aria-label="Параметры сглаживания" hidden>
       <label for="lag-k">Задержка k, кадров
@@ -97,7 +118,8 @@
     <div id="run-info"></div>
     <div class="downloads">
       <a href="trajectory.csv" download>Координаты CSV</a>
-      <a href="metrics.json" download>Метрики JSON</a>
+      <a href="metrics.json" data-reference download>Метрики JSON</a>
+      <a href="report.json" id="run-report" download hidden>Отчёт JSON</a>
       <a id="lag-csv" download hidden>Сглаженные координаты CSV</a>
       <a id="lag-json" download hidden>Сглаженные координаты и метрики JSON</a>
     </div>

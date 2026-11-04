@@ -1,4 +1,5 @@
 const byId = id => document.getElementById(id);
+const way2 = location.pathname.startsWith("/way2/");
 const video = byId("video");
 const chart = byId("chart");
 const map = byId("map");
@@ -118,8 +119,17 @@ function drawMap() {
 
 function drawChart() {
   const {ctx, width, height} = canvasContext(chart);
-  const value = frame => axis === "error" ? (frame.error_m ?? null) :
-    (frame.xyz[axis] === null ? null : frame.xyz[axis] / 100);
+  byId("trajectory-legend").hidden = !lag || axis === "speed";
+  byId("chart-note").textContent = axis === "speed"
+    ? "Скорость центра объекта по недавним наблюдениям. Пропуски означают, что измерений недостаточно."
+    : lag
+      ? "График сравнивает координаты по времени оцениваемого кадра. На карте сглаженная точка появляется после её выдачи."
+      : "Выберите точку графика или кадр в видео.";
+  const value = frame => {
+    if (axis === "speed") return frame.speed_kmh ?? null;
+    if (axis === "error") return frame.error_m ?? null;
+    return frame.xyz[axis] === null ? null : frame.xyz[axis] / 100;
+  };
   const values = frames.map(value);
   const delayedValues = lag?.frames.map(value) ?? [];
   const [min, max] = bounds(values.concat(delayedValues).filter(item => item !== null));
@@ -153,6 +163,9 @@ function paint(frame) {
   ["x", "y", "z"].forEach((id, i) => {
     byId(id).textContent = point.xyz[i] === null ? "—" : number.format(point.xyz[i] / 100) + " м";
   });
+  byId("speed").textContent = point.speed_kmh == null
+    ? "Скорость · нет надёжной оценки"
+    : `Скорость · ≈ ${integer.format(Math.round(point.speed_kmh))} км/ч`;
   const cams = point.cams.length ? `Камеры ${point.cams.join(", ")}` : "Без зрительного наблюдения";
   const error = point.error_m == null ? "" : ` · ошибка ${number.format(point.error_m)} м`;
   byId("detail").textContent = cams + error;
@@ -180,7 +193,7 @@ function sync() {
 }
 
 document.querySelectorAll("[data-axis]").forEach(button => button.addEventListener("click", () => {
-  axis = button.dataset.axis === "error" ? "error" : Number(button.dataset.axis);
+  axis = /^[0-2]$/.test(button.dataset.axis) ? Number(button.dataset.axis) : button.dataset.axis;
   document.querySelectorAll("[data-axis]").forEach(item => item.setAttribute("aria-pressed", item === button));
   if (frames) drawChart();
 }));
@@ -203,7 +216,7 @@ if ("requestVideoFrameCallback" in video) {
 window.addEventListener("resize", () => { if (frames) paint(index); });
 
 function showLag() {
-  for (const id of ["lag-comparison", "lag-current", "trajectory-legend"]) {
+  for (const id of ["lag-comparison", "lag-current"]) {
     byId(id).hidden = false;
   }
   byId("lag-label").textContent = `k = ${lag.k} · история ${lag.history} · ${integer.format(Math.round(1000 * lag.k / data.metadata.fps))} мс по видео`;
@@ -211,8 +224,6 @@ function showLag() {
   const pending = lag.video_frames - lag.released_frames;
   byId("lag-summary").textContent = `Координаты выданы на ${integer.format(lag.prediction_frames)} из ${integer.format(lag.video_frames)} кадров.` +
     (pending ? ` Кадров в конце записи без выдачи — ${integer.format(pending)}.` : "");
-  byId("chart-note").textContent = "График сравнивает координаты по времени оцениваемого кадра. " +
-    "На карте сглаженная точка появляется после её выдачи.";
   const table = byId("lag-metrics");
   table.hidden = !lag.metrics?.fixed_lag?.n;
   if (table.hidden) return;
@@ -275,6 +286,70 @@ function scheduleLag() {
 controls.addEventListener("input", scheduleLag);
 controls.addEventListener("submit", event => event.preventDefault());
 
+function showScenes() {
+  byId("scenes").hidden = false;
+  byId(way2 ? "way2-link" : "way1-link").setAttribute("aria-current", "page");
+}
+
+async function showSamples() {
+  try {
+    const response = await fetch("quality-samples.json");
+    if (!response.ok) return;
+    const {samples} = await response.json();
+    if (!samples.length) return;
+    const distances = samples.map(sample => sample.difference_m).filter(Number.isFinite);
+    const mse = distances.reduce((sum, distance) => sum + distance ** 2, 0) / distances.length;
+    const mae = distances.reduce((sum, distance) => sum + distance, 0) / distances.length;
+    const scores = [
+      ["MSE", mse, "м²"], ["MAE", mae, "м"], ["RMSE", Math.sqrt(mse), "м"],
+      ["Максимум", Math.max(...distances), "м"],
+    ].map(([name, value, unit]) => {
+      const group = document.createElement("div");
+      const term = document.createElement("dt");
+      const score = document.createElement("dd");
+      term.textContent = name;
+      score.textContent = Number.isFinite(value) ? `≈ ${number.format(value)} ${unit}` : "—";
+      group.append(term, score);
+      return group;
+    });
+    const buttons = samples.map(({frame, difference_m, before_difference_m}) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      const value = document.createElement("strong");
+      value.textContent = Number.isFinite(difference_m) ? `≈ ${number.format(difference_m)} м` : "Пропуск";
+      button.append(`Кадр ${frame}`, value);
+      if (Number.isFinite(before_difference_m)) {
+        const previous = document.createElement("small");
+        previous.className = "quiet";
+        previous.textContent = `Было ≈ ${number.format(before_difference_m)} м`;
+        button.append(previous);
+      }
+      button.addEventListener("click", () => {
+        seek(frame);
+        video.scrollIntoView({block: "nearest"});
+      });
+      return button;
+    });
+    byId("sample-count").textContent = `С координатами ${integer.format(distances.length)} из ${integer.format(samples.length)} проверочных кадров`;
+    byId("sample-scores").replaceChildren(...scores);
+    byId("sample-frames").replaceChildren(...buttons);
+    byId("sample-metrics").hidden = false;
+  } catch {
+    // The replay remains usable when the sample report is unavailable.
+  }
+}
+
+if (way2) {
+  showScenes();
+  byId("quality-note").hidden = false;
+  byId("run-report").hidden = false;
+  video.classList.add("way2");
+} else {
+  fetch("/way2/", {method: "HEAD"}).then(response => {
+    if (response.ok) showScenes();
+  }).catch(() => {});
+}
+
 const replay = fetch("replay.json").then(response => {
   if (!response.ok) throw new Error(response.statusText);
   return response.json();
@@ -282,10 +357,18 @@ const replay = fetch("replay.json").then(response => {
 replay.then(payload => {
   data = payload;
   frames = data.frames;
+  const hasSpeed = frames.some(frame => "speed_kmh" in frame);
+  byId("speed").hidden = !hasSpeed;
+  document.querySelector('[data-axis="speed"]').hidden = !hasSpeed;
   controls.hidden = false;
   const {metrics, metadata} = data;
   byId("sequence-name").textContent = metadata.sequence ?? "Way1";
   byId("target-title").textContent = "Траектория в 3D · " + (metadata.object ?? "CargoTruck");
+  document.querySelectorAll("[data-reference]").forEach(item => {
+    item.hidden = !metrics && !(way2 && item.matches("article"));
+    item.classList.toggle("unscored", !metrics);
+  });
+  byId("reference-status").hidden = Boolean(metrics) || !way2;
   if (metrics) {
     byId("mse").textContent = metrics.mse_m2 == null ? "—" : number.format(metrics.mse_m2) + " м²";
     byId("mae").textContent = metrics.mae_m == null ? "—" : number.format(metrics.mae_m) + " м";
@@ -294,14 +377,16 @@ replay.then(payload => {
     if (metrics.error_gt_16m_frames != null) {
       byId("rmse-detail").textContent = `95-й перцентиль ${number.format(metrics.p95_m)} м · ошибка > 16 м на ${integer.format(metrics.error_gt_16m_frames)} кадрах`;
     }
-    byId("coverage").textContent = number.format(100 * metrics.prediction_frames / frames.length) + "%";
-    byId("covered").textContent = `${integer.format(metrics.prediction_frames)} из ${integer.format(frames.length)} кадров`;
-    const seen = (metrics.statuses.mono || 0) + (metrics.statuses.multi || 0) + (metrics.statuses.flow || 0) + (metrics.statuses.motion || 0);
-    byId("observed").textContent = number.format(100 * seen / frames.length) + "%";
   }
-  byId("run-info").textContent = `${metadata.cameras} камер · ${metadata.fps} кадр/с в исходнике · ${number.format(metadata.mean_ms)} мс на шаг трекера`;
+  const predicted = frames.filter(frame => frame.xyz[0] !== null).length;
+  const observed = frames.filter(frame => frame.cams.length > 0).length;
+  byId("coverage").textContent = number.format(100 * predicted / frames.length) + "%";
+  byId("covered").textContent = `${integer.format(predicted)} из ${integer.format(frames.length)} кадров`;
+  byId("observed").textContent = number.format(100 * observed / frames.length) + "%";
+  byId("run-info").textContent = `${metadata.cameras} камер · ${number.format(metadata.fps)} кадр/с в исходнике · ${number.format(metadata.mean_ms)} мс на шаг трекера`;
   paint(0);
   scheduleLag();
+  if (way2) showSamples();
 }).catch(() => {
   byId("error").hidden = false;
   byId("error").textContent = "Не удалось загрузить результаты прогона.";

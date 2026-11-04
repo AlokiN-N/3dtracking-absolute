@@ -13,10 +13,12 @@ import cv2
 import numpy as np
 
 from core.camera import Camera
-from core.dataset import CameraTrack, Pose, read_transform_csv
-from online.geometry import DEFAULT_TARGET, View, intersects
+from core.dataset import CameraTrack, Pose, read_sensor_size, read_transform_csv
+from core.video_sync import video_timelines
+from online.geometry import DEFAULT_TARGET, View, center_of, intersects
 from online.estimation.kinematics import FlowJumpGuard
 from online.estimation.mono_depth import MonoDepth
+from online.estimation.speed import SpeedMeter
 from online import smooth
 from online.target import load_target
 from online.tracker import Tracker
@@ -36,10 +38,12 @@ def sources(root):
             raise ValueError(f"{actor}: expected one matching MP4, found {len(videos)}")
         poses, meta = read_transform_csv(path)
         poses = {f: p for f, p in poses.items() if np.isfinite(np.r_[p.loc, p.rot]).all()}
-        if not poses or not meta["focal_mm"] or not meta["sensor_mm"]:
+        sensor = meta["sensor_mm"] or read_sensor_size(root)
+        if not poses or not meta["focal_mm"] or not sensor:
             raise ValueError(f"{actor}: incomplete calibration")
         key = int(number)
-        result[key] = CameraTrack(key, meta["focal_mm"], meta["sensor_mm"], poses, videos[0])
+        result[key] = CameraTrack(key, meta["focal_mm"], sensor, poses, videos[0],
+                                  focal_by_frame=meta["focal_by_frame"])
     if not result:
         raise ValueError(f"No camera input in {root}")
     return result
@@ -65,12 +69,15 @@ def camera_manifest(path):
             intrinsics = tuple(map(float, intrinsics))
             if len(intrinsics) != 4 or not np.isfinite(intrinsics).all() or min(intrinsics[:2]) <= 0:
                 raise ValueError(f"Camera {key}: expected [fx, fy, cx, cy] in pixels")
-        elif (focal is None or sensor is None or len(sensor) != 2
-              or not np.isfinite([focal, *sensor]).all() or min(focal, *sensor) <= 0):
-            raise ValueError(f"Camera {key}: missing camera intrinsics")
+        else:
+            sensor = sensor or read_sensor_size(path.parent)
+            if (focal is None or sensor is None or len(sensor) != 2
+                    or not np.isfinite([focal, *sensor]).all() or min(focal, *sensor) <= 0):
+                raise ValueError(f"Camera {key}: missing camera intrinsics")
         if not poses:
             raise ValueError(f"Camera {key}: no valid poses")
-        cameras[key] = CameraTrack(key, focal, sensor, poses, path.parent / entry["video"], intrinsics)
+        focal_by_frame = {} if "focal_mm" in entry else meta["focal_by_frame"]
+        cameras[key] = CameraTrack(key, focal, sensor, poses, path.parent / entry["video"], intrinsics, focal_by_frame)
     if not cameras:
         raise ValueError("Specify at least one camera")
     return cameras
@@ -119,8 +126,9 @@ def grid(frames, cameras, estimate, model=DEFAULT_TARGET, views=None):
 
 def run(args):
     cv2.setNumThreads(2)
-    protected = args.robust or args.adaptive
+    protected = args.robust or args.adaptive or args.global_seg is not None
     tracks = camera_manifest(args.cameras) if args.cameras is not None else sources(args.data)
+    use_pts = args.sync == "pts" or (args.sync == "auto" and any(track.focal_by_frame for track in tracks.values()))
     model = load_target(args.target) if args.target is not None else DEFAULT_TARGET
     seed_boxes = dict(args.seed_box)
     if seed_boxes.keys() - tracks.keys() or len(seed_boxes) != len(args.seed_box):
@@ -157,30 +165,42 @@ def run(args):
     ready = {key: cap for key, cap in caps.items() if cap.isOpened() and cap.get(cv2.CAP_PROP_FPS) > 0}
     if not ready or (not protected and len(ready) != len(caps)):
         raise ValueError("Could not open every camera stream")
-    fps = float(next(iter(ready.values())).get(cv2.CAP_PROP_FPS))
-    if protected:
-        rates = Counter(round(cap.get(cv2.CAP_PROP_FPS), 2) for cap in ready.values())
-        fps = rates.most_common(1)[0][0]
-    aligned = {key: cap for key, cap in ready.items() if abs(cap.get(cv2.CAP_PROP_FPS) - fps) <= 0.01}
-    if not protected and len(aligned) != len(caps):
-        raise ValueError("Camera frame rates differ")
-    counts = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cap in aligned.values()]
-    if sys.platform == "win32" and (args.pico_source is not None or modern or args.cab_ray is not None):
-        import torch  # Load PyTorch's cuDNN before ONNX Runtime on Windows.
-    segmenter = Segmenter(args.model, args.threads, labels=model.labels,
-                          exclude=(0,) if model.ground_vehicle else ())
-    prompt = PromptSegmenter(args.sam, args.threads) if args.sam is not None else None
-    print("YOLO providers:", segmenter.model.get_providers(), flush=True)
-    if prompt is not None:
-        print("SAM providers:", prompt.model.enc.get_providers(), flush=True)
+    timelines = {}
+    if use_pts:
+        aligned = ready
+        counts = {key: int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for key, cap in ready.items()}
+        fps, timelines = video_timelines({key: tracks[key].video for key in ready}, counts)
+        length = max(max(frames) for frames in timelines.values()) + 1
+    else:
+        fps = float(next(iter(ready.values())).get(cv2.CAP_PROP_FPS))
+        if protected:
+            rates = Counter(round(cap.get(cv2.CAP_PROP_FPS), 2) for cap in ready.values())
+            fps = rates.most_common(1)[0][0]
+        aligned = {key: cap for key, cap in ready.items() if abs(cap.get(cv2.CAP_PROP_FPS) - fps) <= 0.01}
+        if not protected and len(aligned) != len(caps):
+            raise ValueError("Camera frame rates differ")
+        length = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cap in aligned.values())
     video_masks = None
-    if args.sam_video is not None:
-        from online.perception.video_masks import VideoMasks
+    if args.global_seg is not None:
+        from online.estimation.consensus import ConsensusTracker, GlobalSegmenter
 
-        video_masks = VideoMasks(args.sam_video, revision=args.sam_video_revision)
-    tracker = Tracker(segmenter, fps, args.cadence, prompt, model, seed_boxes,
-                      robust=args.robust, adaptive=args.adaptive, video_masks=video_masks)
-    tracker.camera_ids.update(tracks)
+        tracker = ConsensusTracker(GlobalSegmenter(args.global_seg, model.labels), model, fps, len(tracks))
+    else:
+        if sys.platform == "win32" and (args.pico_source is not None or modern or args.cab_ray is not None):
+            import torch  # Load PyTorch's cuDNN before ONNX Runtime on Windows.
+        segmenter = Segmenter(args.model, args.threads, labels=model.labels,
+                              exclude=(0,) if model.ground_vehicle else ())
+        prompt = PromptSegmenter(args.sam, args.threads) if args.sam is not None else None
+        print("YOLO providers:", segmenter.model.get_providers(), flush=True)
+        if prompt is not None:
+            print("SAM providers:", prompt.model.enc.get_providers(), flush=True)
+        if args.sam_video is not None:
+            from online.perception.video_masks import VideoMasks
+
+            video_masks = VideoMasks(args.sam_video, revision=args.sam_video_revision)
+        tracker = Tracker(segmenter, fps, args.cadence, prompt, model, seed_boxes,
+                          robust=args.robust, adaptive=args.adaptive, video_masks=video_masks)
+        tracker.camera_ids.update(tracks)
     mono_depth = MonoDepth(model, fps) if args.mono_depth else None
     flow_jump_guard = FlowJumpGuard(model, fps) if args.guard_flow_jumps else None
     cab_ray = None
@@ -208,24 +228,29 @@ def run(args):
     records, processing, missing = [], [], {}
     smoother = smooth.FixedLag(args.lag, args.history, args.method) if args.lag is not None else None
     delayed = []
+    speed_meter = SpeedMeter(fps, model.speed)
     writer = None
     with ExitStack() as stack:
         for cap in caps.values():
             stack.callback(cap.release)
         stream = stack.enter_context(open(args.out / "trajectory.csv", "w", newline=""))
         table = csv.writer(stream, delimiter=";")
-        table.writerow(["Frame", "Loc_X", "Loc_Y", "Loc_Z"])
+        table.writerow(["Frame", "Loc_X", "Loc_Y", "Loc_Z", "Speed_m_s", "Speed_km_h"])
         if smoother is not None:
             lag_stream = stack.enter_context((args.out / "trajectory-lag.csv").open("w", newline=""))
             lag_table = csv.writer(lag_stream, delimiter=";")
             lag_table.writerow(smooth.CSV_HEADER)
-        for frame in range(args.limit or max(counts)):
+        for frame in range(min(args.limit, length) if args.limit is not None else length):
             images = {}
             for key, cap in aligned.items():
+                if use_pts and frame not in timelines[key]:
+                    continue
                 ok, image = cap.read()
                 if ok:
                     images[key] = image
-            if not images and not protected:
+                elif use_pts:
+                    raise ValueError(f"Camera {key}: failed to decode frame {frame} at its timestamp")
+            if not images and not protected and not use_pts:
                 break
             cameras = {}
             for key, image in images.items():
@@ -298,7 +323,12 @@ def run(args):
                 estimate.pose = cab_ray.step(estimate.pose, estimate.status, estimate.views, ray_views, images)
             processing.append(time.perf_counter() - start)
             xyz = [round(float(x) * 100, 4) for x in estimate.pose[:3]] if estimate.pose is not None else [None] * 3
-            table.writerow([frame, *xyz])
+            center = (center_of(estimate.pose, model)
+                      if estimate.pose is not None and estimate.status not in {"forecast", "flow"} else None)
+            speed = speed_meter.step(frame, center)
+            speed_mps = round(speed, 4) if speed is not None else None
+            speed_kmh = round(speed * 3.6, 3) if speed is not None else None
+            table.writerow([frame, *xyz, speed_mps, speed_kmh])
             stream.flush()
             if smoother is not None:
                 point = smoother.push(frame, xyz)
@@ -307,7 +337,8 @@ def run(args):
                     lag_table.writerow(smooth.csv_row(point))
                     lag_stream.flush()
             record = {"frame": frame, "xyz": xyz, "status": estimate.status,
-                      "cams": list(estimate.views), "confidence": round(estimate.confidence, 3)}
+                      "cams": list(estimate.views), "confidence": round(estimate.confidence, 3),
+                      "speed_mps": speed_mps, "speed_kmh": speed_kmh}
             if args.joint_pose:
                 record["joint_applied"] = refiner.joint_applied
             if mono_depth is not None:
@@ -328,7 +359,7 @@ def run(args):
                     covariance = pipeline.state.reference_covariance()
                     record["position_std_m"] = (np.sqrt(np.maximum(np.diag(covariance), 0)).tolist()
                                                  if covariance is not None else None)
-            if protected:
+            if args.robust or args.adaptive:
                 record["available_cams"] = sorted(tracker.current_views)
                 record["guard_active"] = tracker.frame_guard
                 record["camera_health"] = {key: tracker.camera_health.get(key, "missing")
@@ -346,6 +377,10 @@ def run(args):
                         img = np.zeros((270, 480, 3), dtype=np.uint8)
                     fixed[key] = img
                 mosaic = grid(fixed, cameras, estimate, model, tracker.current_views)
+                speed_text = "--" if speed_kmh is None else f"{speed_kmh:.1f} km/h"
+                label = f"SPEED {speed_text}"
+                x = mosaic.shape[1] - cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)[0][0] - 12
+                cv2.putText(mosaic, label, (x, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (235, 240, 247), 1, cv2.LINE_AA)
                 if writer is None:
                     writer = cv2.VideoWriter(str(args.out / "control-raw.mp4"),
                                              cv2.VideoWriter_fourcc(*"mp4v"), fps, mosaic.shape[1::-1])
@@ -358,12 +393,17 @@ def run(args):
                       f"{1000*np.mean(processing[-50:]):.0f} ms/frame", flush=True)
     if not records:
         raise RuntimeError("No video frames were decoded")
+    first_video = next(iter(tracks.values())).video.stem
+    sequence = args.cameras.stem if args.cameras is not None else (
+        first_video.split(".FinalImage.")[0] if ".FinalImage." in first_video else args.data.name)
     metadata = {"fps": fps, "frames": len(records), "cameras": len(caps),
                 "mean_ms": round(float(np.mean(processing) * 1000), 2),
                 "p95_ms": round(float(np.percentile(processing, 95) * 1000), 2),
-                "skipped_calibration": missing, "object": model.name,
-                "sequence": args.cameras.stem if args.cameras is not None else
-                ("Way1" if model.ground_vehicle else args.data.name)}
+                "skipped_calibration": missing, "object": model.name, "sequence": sequence,
+                "synchronization": "pts" if use_pts else "index"}
+    if use_pts:
+        metadata["video_frames_missing"] = {key: sum(frame not in frames for frame in range(len(records)))
+                                            for key, frames in timelines.items()}
     if video_masks is not None:
         metadata["sam_video_revision"] = video_masks.revision
     (args.out / "replay.json").write_text(json.dumps({"metadata": metadata, "frames": records}),
@@ -377,8 +417,11 @@ def main():
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--data", type=Path, help="Directory of Unreal exports")
     inputs.add_argument("--cameras", type=Path, help="JSON camera and video manifest")
+    parser.add_argument("--sync", choices=("auto", "index", "pts"), default="auto",
+                        help="Align videos by frame index or presentation timestamp")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", type=Path, default=Path("models/yolo26n-seg.onnx"))
+    parser.add_argument("--global-seg", type=Path, help="Use global segmentation and cross-camera CAD consensus")
     parser.add_argument("--sam", type=Path, help="Optional SAM 2 ONNX filename prefix")
     parser.add_argument("--target", type=Path, help="Metric CAD target JSON (default: Way1 CargoTruck)")
     parser.add_argument("--seed-box", type=seed_box, action="append", default=[],
@@ -418,7 +461,19 @@ def main():
     parser.add_argument("--history", type=smooth.lag_frames, help="Number of past frames for smoothing (default: same as lag)")
     parser.add_argument("--method", choices=smooth.METHODS, default="linear", help="Trajectory smoothing method")
     parser.add_argument("--video", action="store_true")
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if args.global_seg is not None:
+        legacy_options = (args.sam, args.seed_box, args.pico_source, args.pico_checkpoint, args.pico_subpixel,
+                          args.appearance_target, args.joint_pose, args.joint_motion_check, args.joint_spatial_check,
+                          args.recover_second_view, args.mono_depth, args.surface_pose, args.guard_flow_jumps,
+                          args.cab_ray, args.cab_ray_always, args.gotrack_source, args.roma_source, args.tapnext_source,
+                          args.gotrack_checkpoint, args.tapnext_checkpoint, args.sam_video, args.unified,
+                          args.robust, args.adaptive)
+        if not args.global_seg.is_file():
+            parser.error("--global-seg requires a local segmentation checkpoint")
+        if any(legacy_options):
+            parser.error("--global-seg replaces the legacy tracker and its refinements")
+    run(args)
 
 
 if __name__ == "__main__":

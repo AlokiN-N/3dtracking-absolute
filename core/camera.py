@@ -37,7 +37,7 @@ class Camera:
             index=track.index,
             loc=pose.loc.copy(),
             rot=pose.rot.copy(),
-            focal_mm=track.focal_mm,
+            focal_mm=track.focal_by_frame.get(frame, track.focal_mm),
             sensor_mm=track.sensor_mm,
             width=width,
             height=height,

@@ -16,12 +16,18 @@ else:
 MAX_FRAMES = 120
 
 
-def handler(assets, output, reference=None):
+def handler(assets, output, reference=None, way2=None):
     public = {"/": assets / "index.html"}
     for name in ("index.html", "style.css", "viewer.js"):
         public[f"/{name}"] = assets / name
     for name in ("control.mp4", "replay.json", "trajectory.csv", "metrics.json", "lag.json", "trajectory-lag.csv"):
         public[f"/{name}"] = output / name
+    smoothing = {"/api/smooth": (output, reference)}
+    if way2 is not None:
+        public["/way2/"] = assets / "index.html"
+        for name in ("control.mp4", "replay.json", "trajectory.csv", "report.json", "quality-samples.json"):
+            public[f"/way2/{name}"] = way2 / name
+        smoothing["/way2/api/smooth"] = (way2, None)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -32,8 +38,14 @@ def handler(assets, output, reference=None):
 
         def respond(self, body):
             url = urlsplit(self.path)
-            if url.path == "/api/smooth":
-                self.respond_smoothing(url.query, body)
+            if url.path == "/way2" and way2 is not None:
+                self.send_response(308)
+                self.send_header("Location", "/way2/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if url.path in smoothing:
+                self.respond_smoothing(url.query, body, *smoothing[url.path])
                 return
             path = public.get(url.path)
             if path is None or not path.is_file():
@@ -78,7 +90,7 @@ def handler(assets, output, reference=None):
                     except (BrokenPipeError, ConnectionResetError):
                         pass
 
-        def respond_smoothing(self, query, body):
+        def respond_smoothing(self, query, body, replay_output, replay_reference):
             try:
                 if len(query) > 100:
                     raise ValueError("Query is too long")
@@ -96,7 +108,7 @@ def handler(assets, output, reference=None):
                 return
 
             try:
-                frames = json.loads((output / "replay.json").read_text(encoding="utf-8"))["frames"]
+                frames = json.loads((replay_output / "replay.json").read_text(encoding="utf-8"))["frames"]
             except FileNotFoundError:
                 self.send_error(404, "Replay is unavailable")
                 return
@@ -105,7 +117,7 @@ def handler(assets, output, reference=None):
                 point = smoother.push(row["frame"], row["xyz"])
                 if point is not None:
                     delayed.append(point)
-            payload = smooth.lag_report(smoother, frames, delayed, reference)
+            payload = smooth.lag_report(smoother, frames, delayed, replay_reference)
             encoded = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -127,10 +139,11 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--reference", type=Path, help="Reference positions for interactive metrics (CSV or JSON)")
+    parser.add_argument("--way2", type=Path, help="Optional directory containing the Way2 diagnostic replay")
     args = parser.parse_args()
     assets = Path(__file__).resolve().parent.parent / "web"
     reference = smooth.load_reference(args.reference) if args.reference else None
-    with ThreadingHTTPServer(("127.0.0.1", args.port), handler(assets, args.out, reference)) as server:
+    with ThreadingHTTPServer(("127.0.0.1", args.port), handler(assets, args.out, reference, args.way2)) as server:
         print(f"http://127.0.0.1:{args.port}", flush=True)
         server.serve_forever()
 
