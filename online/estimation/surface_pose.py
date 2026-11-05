@@ -60,7 +60,8 @@ class Tracks:
 
 
 def seed_tracks(surface, view, pose, gray):
-    x, y, u, v = np.round(view.instance.box).astype(int)
+    height, width = gray.shape
+    x, y, u, v = np.clip(np.round(view.instance.box).astype(int), 0, [width - 1, height - 1] * 2)
     crop = gray[y:v+1, x:u+1]
     if not crop.size:
         return None

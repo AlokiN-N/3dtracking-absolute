@@ -113,6 +113,12 @@ def draw(img, key, camera, estimate, model=DEFAULT_TARGET, view=None):
             cv2.rectangle(out, tuple(box[:2]), tuple(box[2:]), color, 1, cv2.LINE_AA)
     cv2.rectangle(out, (0, 0), (480, 22), (31, 23, 19), -1)
     status = "TRACKED 2D" if tracked else ("OBSERVED" if key in estimate.views else "NO OBSERVATION")
+    if tracked is not None and tracked.source == "sam-video-local":
+        status = "TRACKED 2D LOCAL"
+    if estimate.status == "cad_points" and key in estimate.views:
+        status = "3D CAD POINTS"
+    if estimate.status in {"cad_flow", "cad_region"} and key in estimate.views:
+        status = "3D CAD FLOW" if estimate.status == "cad_flow" else "3D CAD SILHOUETTE"
     cv2.putText(out, f"CAM {key:02d}  |  {status}",
                 (9, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (235, 240, 247), 1, cv2.LINE_AA)
     return out
@@ -144,8 +150,9 @@ def run(args):
         raise ValueError("GoTrack needs both source and checkpoint")
     if (args.tapnext_source is None) != (args.tapnext_checkpoint is None):
         raise ValueError("TAPNext needs both source and checkpoint")
-    modern = any((args.gotrack_source, args.roma_source, args.tapnext_source, args.unified))
-    if args.appearance_target is not None and args.pico_source is None and not args.surface_pose and not modern:
+    modern = any((args.gotrack_source if not args.cad_points else None,
+                  args.roma_source, args.tapnext_source, args.unified))
+    if args.appearance_target is not None and args.pico_source is None and not args.surface_pose and not modern and not args.cad_points:
         raise ValueError("--appearance-target needs a CAD refinement backend")
     if args.joint_pose and args.pico_source is None:
         raise ValueError("--joint-pose needs PicoPose")
@@ -158,6 +165,12 @@ def run(args):
     if (args.joint_motion_check or args.joint_spatial_check) and not args.joint_pose:
         raise ValueError("--joint-motion-check and --joint-spatial-check need --joint-pose")
     appearance = load_target(args.appearance_target) if args.appearance_target is not None else model
+    if args.cad_points:
+        if appearance.triangles is None:
+            raise ValueError("--cad-points needs a triangular --target or --appearance-target")
+        bounds = lambda target: np.array([target.vertices.min(axis=0), target.vertices.max(axis=0)])
+        if not np.allclose(bounds(model), bounds(appearance), atol=0.03 * model.size, rtol=0):
+            raise ValueError("--cad-points needs a mesh in the tracking target's units, axes and reference frame")
     if modern and appearance.triangles is None:
         raise ValueError("Modern pose estimation requires a triangular CAD target")
     if args.surface_pose:
@@ -193,15 +206,18 @@ def run(args):
         if prompt is not None:
             print("SAM providers:", prompt.model.enc.get_providers(), flush=True)
     video_masks = None
+    reserve_masks = None
     if args.sam_video is not None:
-        from online.perception.video_masks import VideoMasks
+        from online.perception.video_masks import OnDemandMasks, VideoMasks
 
         video_masks = VideoMasks(args.sam_video, revision=args.sam_video_revision)
+        if args.sam_video_fallback is not None:
+            reserve_masks = OnDemandMasks(VideoMasks(args.sam_video_fallback), max(1, round(2.5 * fps)))
     if args.global_seg is not None:
         from online.estimation.consensus import ConsensusTracker, GlobalSegmenter
 
         tracker = ConsensusTracker(GlobalSegmenter(args.global_seg, model.labels), model, fps, len(tracks),
-                                   video_masks=video_masks)
+                                   video_masks=video_masks, reserve_masks=reserve_masks)
     else:
         tracker = Tracker(segmenter, fps, args.cadence, prompt, model, seed_boxes,
                           robust=args.robust, adaptive=args.adaptive, video_masks=video_masks)
@@ -234,6 +250,21 @@ def run(args):
     smoother = smooth.FixedLag(args.lag, args.history, args.method) if args.lag is not None else None
     delayed = []
     speed_meter = SpeedMeter(fps, model.speed)
+    cad_points = None
+    cad_regions = None
+    if args.cad_points:
+        from online.estimation.cad_points import CadPointRecovery
+
+        matcher = None
+        if args.gotrack_source is not None:
+            from online.perception.gotrack import GoTrackRefiner
+
+            matcher = GoTrackRefiner(args.gotrack_source, args.gotrack_checkpoint, appearance, args.renderer)
+        cad_points = CadPointRecovery(appearance, fps, matcher)
+    if args.cad_regions:
+        from online.estimation.region_flow import CadRegionRecovery
+
+        cad_regions = CadRegionRecovery(appearance, fps)
     writer = None
     with ExitStack() as stack:
         for cap in caps.values():
@@ -266,6 +297,10 @@ def run(args):
                     missing[key] = missing.get(key, 0) + 1
             start = time.perf_counter()
             estimate = tracker.step(frame, cameras, images)
+            if cad_points is not None:
+                estimate = cad_points.step(frame, estimate, cameras, images)
+            if cad_regions is not None:
+                estimate = cad_regions.step(frame, estimate, cameras, images)
             if (any(refinement is not None for refinement in (refiner, mono_depth, surface_pose, flow_jump_guard, pipeline))
                     and estimate.pose is not None):
                 views = [view if tracker.frame_guard else View.of(view.camera, tracker.memory[key].mask, model)
@@ -329,7 +364,9 @@ def run(args):
             processing.append(time.perf_counter() - start)
             xyz = [round(float(x) * 100, 4) for x in estimate.pose[:3]] if estimate.pose is not None else [None] * 3
             center = (center_of(estimate.pose, model)
-                      if estimate.pose is not None and estimate.status not in {"forecast", "flow", "mask_multi"} else None)
+                      if estimate.pose is not None and estimate.status not in {
+                          "forecast", "flow", "mask_multi", "mask_large", "cad_points", "cad_flow", "cad_region"}
+                      else None)
             speed = speed_meter.step(frame, center)
             speed_mps = round(speed, 4) if speed is not None else None
             speed_kmh = round(speed * 3.6, 3) if speed is not None else None
@@ -344,9 +381,15 @@ def run(args):
             record = {"frame": frame, "xyz": xyz, "status": estimate.status,
                       "cams": list(estimate.views), "confidence": round(estimate.confidence, 3),
                       "speed_mps": speed_mps, "speed_kmh": speed_kmh}
+            if cad_points is not None and cad_points.precision_m is not None:
+                record["cad_reference_std_m"] = round(float(cad_points.precision_m), 3)
             if estimate.tracked_2d:
                 record["tracked_2d_boxes"] = {key: item.box.round(1).tolist()
                                               for key, item in estimate.tracked_2d.items()}
+                local_cameras = [key for key, item in estimate.tracked_2d.items()
+                                 if item.source == "sam-video-local"]
+                if local_cameras:
+                    record["local_2d_cams"] = local_cameras
             if args.joint_pose:
                 record["joint_applied"] = refiner.joint_applied
             if mono_depth is not None:
@@ -414,6 +457,8 @@ def run(args):
                                             for key, frames in timelines.items()}
     if video_masks is not None:
         metadata["sam_video_revision"] = video_masks.revision
+    if reserve_masks is not None:
+        metadata["sam_video_fallback_revision"] = reserve_masks.backend.revision
     (args.out / "replay.json").write_text(json.dumps({"metadata": metadata, "frames": records}),
                                          encoding="utf-8")
     if smoother is not None:
@@ -456,6 +501,9 @@ def main():
     parser.add_argument("--tapnext-checkpoint", type=Path, help="TAPNext NPZ checkpoint")
     parser.add_argument("--sam-video", help="Hugging Face SAM2 Video checkpoint or local directory")
     parser.add_argument("--sam-video-revision", help="Pinned revision for a custom Hugging Face SAM2 checkpoint")
+    parser.add_argument("--sam-video-fallback", help="Reserve SAM2 Video checkpoint used only for missing 3D")
+    parser.add_argument("--cad-points", action="store_true", help="Recover missing 3D using tracked points on a metric CAD mesh")
+    parser.add_argument("--cad-regions", action="store_true", help="Recover missing 3D using visible CAD silhouette and dense motion")
     parser.add_argument("--unverified-measurements", action="store_true", help="Research mode: allow geometric candidates without independent temporal verification")
     parser.add_argument("--sequential-models", action="store_true", help="Park inactive neural backends on CPU to bound GPU memory")
     parser.add_argument("--unified", action="store_true", help="Use a generic causal SE(3) state with covariance")
@@ -470,12 +518,20 @@ def main():
     parser.add_argument("--method", choices=smooth.METHODS, default="linear", help="Trajectory smoothing method")
     parser.add_argument("--video", action="store_true")
     args = parser.parse_args()
+    if args.sam_video_fallback is not None and (args.sam_video is None or args.global_seg is None):
+        parser.error("--sam-video-fallback requires --sam-video and --global-seg")
+    if args.cad_points and (args.sam_video is None or args.global_seg is None):
+        parser.error("--cad-points requires --sam-video and --global-seg")
+    if args.cad_regions and not args.cad_points:
+        parser.error("--cad-regions requires --cad-points")
     if args.global_seg is not None:
         legacy_options = (args.sam, args.seed_box, args.pico_source, args.pico_checkpoint, args.pico_subpixel,
-                          args.appearance_target, args.joint_pose, args.joint_motion_check, args.joint_spatial_check,
+                          args.appearance_target if not args.cad_points else None,
+                          args.joint_pose, args.joint_motion_check, args.joint_spatial_check,
                           args.recover_second_view, args.mono_depth, args.surface_pose, args.guard_flow_jumps,
-                          args.cab_ray, args.cab_ray_always, args.gotrack_source, args.roma_source, args.tapnext_source,
-                          args.gotrack_checkpoint, args.tapnext_checkpoint, args.unified,
+                          args.cab_ray, args.cab_ray_always, args.roma_source, args.tapnext_source,
+                          args.gotrack_source if not args.cad_points else None,
+                          args.gotrack_checkpoint if not args.cad_points else None, args.tapnext_checkpoint, args.unified,
                           args.robust, args.adaptive)
         if not args.global_seg.is_file():
             parser.error("--global-seg requires a local segmentation checkpoint")

@@ -8,6 +8,7 @@ import numpy as np
 from core.camera import Camera
 from online.estimation.consensus import ConsensusTracker
 from online.geometry import DEFAULT_TARGET, Rot, View, center_of
+from online.perception.video_masks import OnDemandMasks
 from online.perception.vision import Instance
 from online.target import Target
 
@@ -32,12 +33,17 @@ class Detector:
 class MaskMemory:
     def __init__(self):
         self.sessions = {}
+        self.calls = []
+        self.fail_frame = None
 
     def discard_missing(self, frame, keys):
         self.sessions = {key: item for key, item in self.sessions.items()
                          if key in keys and item[0] == frame - 1}
 
     def step(self, frame, key, image, seed):
+        self.calls.append((frame, key))
+        if frame == self.fail_frame:
+            return None
         if seed is None:
             previous_frame, seed = self.sessions[key]
             if frame != previous_frame + 1:
@@ -108,6 +114,42 @@ class ConsensusTests(unittest.TestCase):
         np.testing.assert_allclose(center_of(recovered.pose, model), center_of(truth, model), atol=1.0)
         self.assertEqual(tracker.last_seen, 0)
         self.assertIsNone(tracker.step(33, {2: cameras[2]}, {2: images[2]}).pose)
+
+        memory, backup = MaskMemory(), MaskMemory()
+        memory.fail_frame = 31
+        tracker = ConsensusTracker(detector, model, 30, len(cameras), video_masks=memory,
+                                   reserve_masks=OnDemandMasks(backup, 75))
+        detector.detections = masks
+        self.assertEqual(tracker.step(0, cameras, images).status, "multi")
+        detector.detections = {}
+        for frame in range(1, 31):
+            self.assertEqual(tracker.step(frame, cameras, images).status, "forecast")
+        self.assertEqual(backup.calls, [])
+        self.assertIsNone(tracker.step(31, cameras, images).pose)
+        self.assertEqual(backup.calls, [])
+        recovered = tracker.step(32, cameras, images)
+        self.assertEqual(recovered.status, "mask_large")
+        self.assertEqual(set(recovered.views), {1, 2})
+        self.assertEqual([f for f, k in backup.calls if k == 1], list(range(33)))
+        self.assertIsNone(tracker.previous_output)
+        self.assertEqual(tracker.mask_frame, 30)
+        self.assertIsNone(tracker.step(33, {2: cameras[2]}, {2: images[2]}).pose)
+
+        memory = MaskMemory()
+        tracker = ConsensusTracker(detector, model, 30, len(cameras), video_masks=memory)
+        detector.detections = masks
+        self.assertEqual(tracker.step(0, cameras, images).status, "multi")
+        detector.detections = {}
+        for frame in range(1, 71):
+            tracker.step(frame, {2: cameras[2]}, {2: images[2]})
+        detector.detections = {2: [Instance(masks[2][0].contour, 0.24, masks[2][0].label)]}
+        self.assertIsNone(tracker.step(71, {2: cameras[2]}, {2: images[2]}).pose)
+        detector.detections = {}
+        for frame in range(72, 117):
+            estimate = tracker.step(frame, {2: cameras[2]}, {2: images[2]})
+        self.assertIsNone(estimate.pose)
+        self.assertEqual(estimate.tracked_2d[2].source, "sam-video-local")
+        self.assertNotIn(2, tracker.step(117, {2: cameras[2]}, {2: images[2]}).tracked_2d)
 
     def test_acquires_a_free_rigid_object_from_two_calibrated_views(self):
         body = np.array(list(product((-2.0, 2.0), (-0.8, 0.8), (-0.6, 0.6))))

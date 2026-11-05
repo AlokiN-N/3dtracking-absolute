@@ -1,4 +1,5 @@
 """Acquire and track one rigid target from calibrated, synchronized views."""
+from dataclasses import replace
 from itertools import combinations
 
 import cv2
@@ -99,7 +100,7 @@ def compatible_rays(first, second, size):
 
 
 class ConsensusTracker:
-    def __init__(self, segmenter, model, fps, camera_count, video_masks=None):
+    def __init__(self, segmenter, model, fps, camera_count, video_masks=None, reserve_masks=None):
         self.segmenter = segmenter
         self.model = model
         self.fps = fps
@@ -113,7 +114,13 @@ class ConsensusTracker:
         self.masks = {}
         self.video_masks = video_masks
         self.image_tracks = {}
+        self.image_detections = {}
+        self.image_evidence = {}
         self.mask_horizon = max(1, round(2.5 * fps))
+        self.image_horizon = max(1, round(1.5 * fps))
+        self.reserve_masks = reserve_masks
+        self.previous_emitted = None
+        self.reserve_pose = None
         self.mask_pose = None
         self.mask_velocity = np.zeros(3)
         self.mask_frame = -1
@@ -145,6 +152,7 @@ class ConsensusTracker:
                 for key, instances in self.segmenter.regions(images, {key: unmatched[key] for key in keys[:4]}).items():
                     recovered = [item for item in instances if box_overlap(item.box, unmatched[key]) >= 0.35]
                     detections[key] = [*detections.get(key, ()), *recovered]
+        self.image_detections = detections
         observations = {}
         for key, view in self.current_views.items():
             instances = detections.get(key, [])
@@ -164,26 +172,37 @@ class ConsensusTracker:
     def track_image_masks(self, estimate, cameras, images):
         self.video_masks.discard_missing(self.frame, cameras.keys() & self.image_tracks.keys())
         tracks = {}
+        evidence = {}
         for key in cameras:
             image = images[key]
             detection = estimate.views.get(key)
             if detection is not None and not detection.flow:
                 tracks[key] = self.frame, image, detection
+                evidence[key] = self.frame
                 self.video_masks.sessions.pop(key, None)
                 continue
             previous = self.image_tracks.get(key)
             if previous is None:
                 continue
             last_detection, previous_image, previous_mask = previous
-            if self.frame - last_detection > self.mask_horizon or image.shape != previous_image.shape:
+            last_evidence = self.image_evidence[key]
+            image_only = self.frame - last_detection > self.mask_horizon
+            if image.shape != previous_image.shape or (image_only and self.frame - last_evidence > self.image_horizon):
                 continue
             if key not in self.video_masks.sessions:
                 self.video_masks.step(self.frame - 1, key, previous_image, previous_mask)
             mask = self.video_masks.step(self.frame, key, image, None)
             if mask is not None and box_overlap(mask.box, previous_mask.box) >= 0.45:
+                if any(item.score >= 0.18 and box_overlap(item.box, mask.box) >= 0.65
+                       for item in self.image_detections.get(key, ())):
+                    last_evidence = self.frame
+                if image_only:
+                    mask = replace(mask, source="sam-video-local")
                 tracks[key] = last_detection, image, mask
+                evidence[key] = last_evidence
                 estimate.tracked_2d[key] = mask
         self.image_tracks = tracks
+        self.image_evidence = evidence
 
     @staticmethod
     def support(pose, groups, threshold):
@@ -251,10 +270,50 @@ class ConsensusTracker:
     def step(self, frame, cameras, images):
         estimate = self.estimate_pose(frame, cameras, images)
         if self.video_masks is not None:
+            if self.reserve_masks is not None:
+                self.reserve_masks.remember(frame, cameras, images, estimate.views)
             self.track_image_masks(estimate, cameras, images)
+            previous_primary = self.previous_output
             estimate = self.recover_mask_pose(estimate)
             self.previous_output = estimate.pose
+            if self.reserve_masks is not None:
+                if estimate.pose is None and previous_primary is None:
+                    estimate = self.recover_reserve_pose(estimate)
+                self.reserve_pose = estimate.pose if estimate.status == "mask_large" else None
+                self.previous_emitted = estimate.pose
         return estimate
+
+    def recover_reserve_pose(self, estimate):
+        gap = self.frame - self.mask_frame
+        if self.mask_pose is None or gap > max(1, round(self.fps / 2)):
+            return estimate
+        masks = self.reserve_masks.candidates(self.frame)
+        if len(masks) < 2:
+            return estimate
+        primary_prior = self.mask_pose.copy()
+        primary_prior[:3] += gap * self.mask_velocity
+        prior = primary_prior
+        steps = max(1, gap)
+        if self.reserve_pose is not None:
+            prior = self.reserve_pose.copy()
+            prior[:3] += self.mask_velocity
+            steps = 1
+        result = self.fit_mask_pair(masks, prior, steps)
+        if result is None:
+            return estimate
+        score, pose, pair = result
+        # A relaxed fit is only an agreement check for switching models.
+        # Its pose is never emitted on its own.
+        primary = self.fit_mask_pair(estimate.tracked_2d, primary_prior, max(1, gap),
+                                     weak_iou=0.32, strong_iou=0.52)
+        reference = primary[1] if primary is not None else primary_prior
+        if np.linalg.norm(pose[:3] - reference[:3]) > max(0.8, self.model.speed / self.fps):
+            return estimate
+        limit = max(1.5, 2 * self.model.speed / self.fps)
+        if self.previous_emitted is not None and np.linalg.norm(pose[:3] - self.previous_emitted[:3]) > limit:
+            return estimate
+        views = {ob.view.camera.index: ob.view.instance for ob in pair}
+        return Estimate(pose, "mask_large", views, score, {**estimate.tracked_2d, **views})
 
     def recover_mask_pose(self, estimate):
         if estimate.views:
@@ -265,10 +324,28 @@ class ConsensusTracker:
         gap = self.frame - self.mask_frame
         if self.mask_pose is None or gap > max(1, round(self.fps / 2)):
             return estimate
-        observations = [Observation(View.of(self.current_views[key].camera, mask, self.model))
-                        for key, mask in estimate.tracked_2d.items()]
         prior = self.mask_pose.copy()
         prior[:3] += gap * self.mask_velocity
+        best = self.fit_mask_pair(estimate.tracked_2d, prior, gap)
+        if best is None:
+            return estimate
+        score, pose, pair = best
+        velocity = (center_of(pose, self.model) - center_of(self.mask_pose, self.model)) / gap
+        self.mask_velocity += 0.25 * (velocity - self.mask_velocity)
+        speed_limit = self.model.speed / self.fps
+        self.mask_velocity *= min(1, speed_limit / max(np.linalg.norm(self.mask_velocity), 1e-9))
+        self.mask_pose, self.mask_frame = pose, self.frame
+        if estimate.pose is None:
+            if self.previous_output is not None and np.linalg.norm(
+                    pose[:3] - self.previous_output[:3]) > max(1.5, 2 * speed_limit):
+                return estimate
+            views = {ob.view.camera.index: ob.view.instance for ob in pair}
+            return Estimate(pose, "mask_multi", views, score, estimate.tracked_2d)
+        return estimate
+
+    def fit_mask_pair(self, masks, prior, gap, weak_iou=0.42, strong_iou=0.62):
+        observations = [Observation(View.of(self.current_views[key].camera, mask, self.model))
+                        for key, mask in masks.items() if mask.source != "sam-video-local"]
         best = None
         for a, b in combinations(observations, 2):
             if a.clipped or b.clipped or not compatible_rays(a, b, self.model.size):
@@ -290,27 +367,13 @@ class ConsensusTracker:
                 overlap = [ob.overlap(pose) for ob in pair]
                 score = min(overlap)
                 weak_view = score < 0.52
-                if weak_view and (score < 0.42 or max(overlap) < 0.62):
+                if weak_view and (score < weak_iou or max(overlap) < strong_iou):
                     continue
                 if np.linalg.norm(center_of(pose, self.model) - center_of(prior, self.model)) > limit:
                     continue
                 if best is None or score > best[0]:
                     best = score, pose, pair
-        if best is None:
-            return estimate
-        score, pose, pair = best
-        velocity = (center_of(pose, self.model) - center_of(self.mask_pose, self.model)) / gap
-        self.mask_velocity += 0.25 * (velocity - self.mask_velocity)
-        speed_limit = self.model.speed / self.fps
-        self.mask_velocity *= min(1, speed_limit / max(np.linalg.norm(self.mask_velocity), 1e-9))
-        self.mask_pose, self.mask_frame = pose, self.frame
-        if estimate.pose is None:
-            if self.previous_output is not None and np.linalg.norm(
-                    pose[:3] - self.previous_output[:3]) > max(1.5, 2 * speed_limit):
-                return estimate
-            views = {ob.view.camera.index: ob.view.instance for ob in pair}
-            return Estimate(pose, "mask_multi", views, score, estimate.tracked_2d)
-        return estimate
+        return best
 
     def estimate_pose(self, frame, cameras, images):
         if frame != self.frame + 1:

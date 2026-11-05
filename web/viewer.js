@@ -13,7 +13,7 @@ const integer = new Intl.NumberFormat("ru-RU");
 const green = "#86f0b4";
 const orange = "#ff8f53";
 const muted = "#a5b3c2";
-const names = {multi: "Триангуляция", mask_multi: "3D по сопровождению масок", mono: "Одна камера", motion: "Движение и рёбра", flow: "Оптический поток", forecast: "Прогноз", lost: "Потеря"};
+const names = {multi: "Триангуляция", mask_multi: "3D по сопровождению масок", mask_large: "3D по резервным маскам Large", cad_points: "3D по точкам CAD", cad_flow: "3D по движению области CAD", cad_region: "3D по видимому силуэту CAD", mono: "Одна камера", motion: "Движение и рёбра", flow: "Оптический поток", forecast: "Прогноз", lost: "Потеря"};
 const pad = {left: 51, right: 16, top: 13, bottom: 23};
 let data;
 let frames;
@@ -166,10 +166,10 @@ function paint(frame) {
   byId("speed").textContent = point.speed_kmh == null
     ? "Скорость · нет надёжной оценки"
     : `Скорость · ≈ ${integer.format(Math.round(point.speed_kmh))} км/ч`;
-  const cams = point.cams.length ? `Камеры ${point.cams.join(", ")}` : "Без зрительного наблюдения";
+  const cams = point.cams.length ? `Камеры в 3D · ${point.cams.join(", ")}` : "Без наблюдений для 3D";
   const error = point.error_m == null ? "" : ` · ошибка ${number.format(point.error_m)} м`;
   const imageCams = Object.keys(point.tracked_2d_boxes ?? {});
-  const tracking = imageCams.length ? ` · 2D-сопровождение: камеры ${imageCams.join(", ")}` : "";
+  const tracking = imageCams.length ? ` · 2D-сопровождение · камеры ${imageCams.join(", ")}` : "";
   byId("detail").textContent = cams + error + tracking;
   if (lag) {
     const delayed = lag.frames[index - lag.k];
@@ -383,10 +383,12 @@ replay.then(payload => {
   }
   const predicted = frames.filter(frame => frame.xyz[0] !== null).length;
   const observed = frames.filter(frame => frame.cams.length > 0).length;
-  const recovered = frames.filter(frame => frame.status === "mask_multi").length;
+  const recovered = frames.filter(frame => ["mask_multi", "mask_large"].includes(frame.status)).length;
+  const cadRecovered = frames.filter(frame => ["cad_points", "cad_flow", "cad_region"].includes(frame.status)).length;
   byId("coverage").textContent = number.format(100 * predicted / frames.length) + "%";
   byId("covered").textContent = `${integer.format(predicted)} из ${integer.format(frames.length)} кадров`;
   if (recovered) byId("covered").textContent += ` · ${integer.format(recovered)} восстановлено по двум маскам`;
+  if (cadRecovered) byId("covered").textContent += ` · ${integer.format(cadRecovered)} по CAD`;
   byId("observed").textContent = number.format(100 * observed / frames.length) + "%";
   byId("run-info").textContent = `${metadata.cameras} камер · ${number.format(metadata.fps)} кадр/с в исходнике · ${number.format(metadata.mean_ms)} мс на шаг трекера`;
   paint(0);

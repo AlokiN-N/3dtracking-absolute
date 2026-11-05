@@ -1,8 +1,11 @@
 """SAM2 sessions consuming exactly one new image per camera and timestamp."""
+from dataclasses import dataclass, field
+
 import cv2
 import numpy as np
 
 from online.perception.vision import Instance
+from online.tracker import box_overlap
 
 
 class VideoMasks:
@@ -16,6 +19,7 @@ class VideoMasks:
             revision = {
                 "facebook/sam2.1-hiera-tiny": "de431c4043854a71d8101e17995dfe596bf101a5",
                 "facebook/sam2.1-hiera-base-plus": "b7320756a13354e7530a63935656d35b2f91a290",
+                "facebook/sam2.1-hiera-large": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
             }.get(checkpoint)
         self.model = Sam2VideoModel.from_pretrained(checkpoint, revision=revision).to(device).eval()
         self.processor = Sam2VideoProcessor.from_pretrained(checkpoint, revision=revision)
@@ -64,3 +68,59 @@ class VideoMasks:
         if cv2.contourArea(contour) < 50:
             return None
         return Instance(contour[:, 0].astype(float), 0.8, -1, source="sam-video")
+
+
+@dataclass
+class MaskHistory:
+    seed_frame: int
+    frame: int
+    shape: tuple
+    mask: Instance
+    pending: list = field(default_factory=list)
+
+
+class OnDemandMasks:
+    """Keep bounded, causal histories and run the reserve model only on request."""
+
+    def __init__(self, backend, horizon):
+        self.backend = backend
+        self.horizon = horizon
+        self.histories = {}
+
+    def remember(self, frame, cameras, images, detections):
+        for key, history in list(self.histories.items()):
+            if (key not in cameras or history.frame != frame - 1 or
+                    frame - history.seed_frame > self.horizon or images[key].shape != history.shape):
+                del self.histories[key]
+                self.backend.sessions.pop(key, None)
+        for key in cameras:
+            image = images[key]
+            detection = detections.get(key)
+            if detection is not None and not detection.flow:
+                self.backend.sessions.pop(key, None)
+                self.histories[key] = MaskHistory(frame, frame, image.shape, detection, [(frame, image, detection)])
+            elif key in self.histories:
+                history = self.histories[key]
+                history.pending.append((frame, image, None))
+                history.frame = frame
+
+    def candidates(self, frame):
+        eligible = {key: history for key, history in self.histories.items()
+                    if history.seed_frame < frame == history.frame}
+        if len(eligible) < 2:
+            return {}
+        result = {}
+        for key, history in eligible.items():
+            for index, image, seed in history.pending:
+                mask = self.backend.step(index, key, image, seed)
+                if seed is not None:
+                    continue
+                if mask is None or box_overlap(mask.box, history.mask.box) < 0.45:
+                    del self.histories[key]
+                    self.backend.sessions.pop(key, None)
+                    break
+                history.mask = mask
+            else:
+                history.pending.clear()
+                result[key] = history.mask
+        return result
