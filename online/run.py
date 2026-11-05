@@ -22,6 +22,7 @@ from online.estimation.speed import SpeedMeter
 from online import smooth
 from online.target import load_target
 from online.tracker import Tracker
+from online.estimation.gap_fill import FILLED, GapFillGuard
 from online.perception.vision import PromptSegmenter, Segmenter
 
 
@@ -115,6 +116,12 @@ def draw(img, key, camera, estimate, model=DEFAULT_TARGET, view=None):
     status = "TRACKED 2D" if tracked else ("OBSERVED" if key in estimate.views else "NO OBSERVATION")
     if tracked is not None and tracked.source == "sam-video-local":
         status = "TRACKED 2D LOCAL"
+    if estimate.status == "weak" and key in estimate.views:
+        status = "WEAK OBSERVATION"
+    if estimate.status in {"guess", "predicted", "startup_prediction", "stereo_recheck_prediction", "rejoining"}:
+        status = "REJOINING" if estimate.status == "rejoining" else "PREDICTED"
+    if estimate.status in {"stereo_recovery", "stereo_recheck"} and key in estimate.views:
+        status = "VERIFIED CAD PART" if estimate.status == "stereo_recovery" else "VERIFIED STEREO"
     if estimate.status == "cad_points" and key in estimate.views:
         status = "3D CAD POINTS"
     if estimate.status in {"cad_flow", "cad_region"} and key in estimate.views:
@@ -217,11 +224,18 @@ def run(args):
         from online.estimation.consensus import ConsensusTracker, GlobalSegmenter
 
         tracker = ConsensusTracker(GlobalSegmenter(args.global_seg, model.labels), model, fps, len(tracks),
-                                   video_masks=video_masks, reserve_masks=reserve_masks)
+                                   video_masks=video_masks, reserve_masks=reserve_masks,
+                                   acquire_clipped=args.acquire_clipped, single_camera=args.single_camera)
     else:
         tracker = Tracker(segmenter, fps, args.cadence, prompt, model, seed_boxes,
                           robust=args.robust, adaptive=args.adaptive, video_masks=video_masks)
         tracker.camera_ids.update(tracks)
+    gap_fill = None
+    gap_guard = GapFillGuard(fps, model.speed) if args.guarded_gaps else None
+    if args.fill_gaps or args.guarded_gaps:
+        from online.estimation.gap_fill import GapFill
+
+        gap_fill = GapFill(tracker, model, fps)
     mono_depth = MonoDepth(model, fps) if args.mono_depth else None
     flow_jump_guard = FlowJumpGuard(model, fps) if args.guard_flow_jumps else None
     cab_ray = None
@@ -265,6 +279,27 @@ def run(args):
         from online.estimation.region_flow import CadRegionRecovery
 
         cad_regions = CadRegionRecovery(appearance, fps)
+    cold_start = None
+    gap_handoff = None
+    weak_recovery = None
+    if args.precision_recovery_model is not None:
+        import onnxruntime as ort
+
+        from online.estimation.cold_start import ColdStartRecovery
+        from online.estimation.gap_handoff import GapHandoff
+
+        if model.reference_part is None:
+            raise ValueError("Precision recovery requires a CAD reference part")
+        if "CUDAExecutionProvider" in ort.get_available_providers() and hasattr(ort, "preload_dlls"):
+            ort.preload_dlls(directory="")
+        alternate = GlobalSegmenter(args.precision_recovery_model, model.labels)
+        prompt_recovery = PromptSegmenter(args.precision_recovery_sam, args.threads)
+        cold_start = ColdStartRecovery(alternate, prompt_recovery, model, fps)
+        gap_handoff = GapHandoff(fps, model.speed)
+        if args.verify_weak_tracks:
+            from online.estimation.weak_track_recovery import WeakTrackRecovery
+
+            weak_recovery = WeakTrackRecovery(alternate, prompt_recovery, model, fps)
     writer = None
     with ExitStack() as stack:
         for cap in caps.values():
@@ -301,6 +336,17 @@ def run(args):
                 estimate = cad_points.step(frame, estimate, cameras, images)
             if cad_regions is not None:
                 estimate = cad_regions.step(frame, estimate, cameras, images)
+            primary_missing = estimate.pose is None
+            if cold_start is not None:
+                estimate = cold_start.step(frame, estimate, cameras, images)
+            if weak_recovery is not None and cold_start.finished:
+                estimate = weak_recovery.step(frame, estimate, cameras, images)
+                primary_missing |= estimate.status.startswith("stereo_recheck")
+            if gap_fill is not None:
+                proposal = gap_fill.step(frame, estimate, images)
+                estimate = gap_guard.step(frame, estimate, proposal) if gap_guard is not None else proposal
+            if gap_handoff is not None:
+                estimate = gap_handoff.step(estimate, primary_missing)
             if (any(refinement is not None for refinement in (refiner, mono_depth, surface_pose, flow_jump_guard, pipeline))
                     and estimate.pose is not None):
                 views = [view if tracker.frame_guard else View.of(view.camera, tracker.memory[key].mask, model)
@@ -365,7 +411,9 @@ def run(args):
             xyz = [round(float(x) * 100, 4) for x in estimate.pose[:3]] if estimate.pose is not None else [None] * 3
             center = (center_of(estimate.pose, model)
                       if estimate.pose is not None and estimate.status not in {
-                          "forecast", "flow", "mask_multi", "mask_large", "cad_points", "cad_flow", "cad_region"}
+                          "forecast", "flow", "mask_multi", "mask_large", "cad_points", "cad_flow", "cad_region",
+                          "stereo_recovery", "startup_prediction", "stereo_recheck",
+                          "stereo_recheck_prediction", "rejoining", *FILLED}
                       else None)
             speed = speed_meter.step(frame, center)
             speed_mps = round(speed, 4) if speed is not None else None
@@ -475,6 +523,23 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", type=Path, default=Path("models/yolo26n-seg.onnx"))
     parser.add_argument("--global-seg", type=Path, help="Use global segmentation and cross-camera CAD consensus")
+    parser.add_argument("--acquire-clipped", action="store_true",
+                        help="With --global-seg: allow acquisition from a camera pair where one mask touches the frame edge")
+    parser.add_argument("--single-camera", action="store_true",
+                        help="With --global-seg: allow acquisition from one camera when a confident detection persists")
+    gap_modes = parser.add_mutually_exclusive_group()
+    gap_modes.add_argument("--fill-gaps", action="store_true",
+                           help="Try experimental weak observations and causal forecasts for missing 3D")
+    gap_modes.add_argument("--no-fill-gaps", action="store_false", dest="fill_gaps", default=False,
+                           help="Leave frames without a tracker pose empty (the default)")
+    gap_modes.add_argument("--guarded-gaps", action="store_true",
+                           help="Recover only gaps supported by a visible mask and a recent metric observation")
+    parser.add_argument("--precision-recovery-model", type=Path,
+                        help="Alternate segmentation weights for accurate initialization in full coverage mode")
+    parser.add_argument("--precision-recovery-sam", type=Path,
+                        help="SAM 2 ONNX prefix for verifying the visible CAD reference part")
+    parser.add_argument("--verify-weak-tracks", action="store_true",
+                        help="Verify weak tracking runs using an independent stereo estimate")
     parser.add_argument("--sam", type=Path, help="Optional SAM 2 ONNX filename prefix")
     parser.add_argument("--target", type=Path, help="Metric CAD target JSON (default: Way1 CargoTruck)")
     parser.add_argument("--seed-box", type=seed_box, action="append", default=[],
@@ -518,10 +583,23 @@ def main():
     parser.add_argument("--method", choices=smooth.METHODS, default="linear", help="Trajectory smoothing method")
     parser.add_argument("--video", action="store_true")
     args = parser.parse_args()
+    if args.verify_weak_tracks and args.precision_recovery_model is None:
+        parser.error("--verify-weak-tracks requires precision recovery")
+    if args.precision_recovery_model is not None or args.precision_recovery_sam is not None:
+        if (args.global_seg is None or not args.fill_gaps
+                or args.precision_recovery_model is None or not args.precision_recovery_model.is_file()
+                or args.precision_recovery_sam is None or any(
+                    not Path(f"{args.precision_recovery_sam}.{part}.onnx").is_file()
+                    for part in ("encoder", "decoder"))):
+            parser.error("Precision recovery requires --global-seg, --fill-gaps, alternate weights and SAM 2 ONNX files")
+    if (args.acquire_clipped or args.single_camera) and args.global_seg is None:
+        parser.error("--acquire-clipped and --single-camera need --global-seg")
     if args.sam_video_fallback is not None and (args.sam_video is None or args.global_seg is None):
         parser.error("--sam-video-fallback requires --sam-video and --global-seg")
     if args.cad_points and (args.sam_video is None or args.global_seg is None):
         parser.error("--cad-points requires --sam-video and --global-seg")
+    if (args.fill_gaps or args.guarded_gaps) and args.global_seg is None:
+        parser.error("Gap recovery requires --global-seg")
     if args.cad_regions and not args.cad_points:
         parser.error("--cad-regions requires --cad-points")
     if args.global_seg is not None:

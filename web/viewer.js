@@ -13,7 +13,10 @@ const integer = new Intl.NumberFormat("ru-RU");
 const green = "#86f0b4";
 const orange = "#ff8f53";
 const muted = "#a5b3c2";
-const names = {multi: "Триангуляция", mask_multi: "3D по сопровождению масок", mask_large: "3D по резервным маскам Large", cad_points: "3D по точкам CAD", cad_flow: "3D по движению области CAD", cad_region: "3D по видимому силуэту CAD", mono: "Одна камера", motion: "Движение и рёбра", flow: "Оптический поток", forecast: "Прогноз", lost: "Потеря"};
+const names = {guess: "Начальная оценка", predicted: "Прогноз без наблюдений",
+  weak: "Оценка по слабым наблюдениям", stereo_recovery: "Захват по проверенной части CAD",
+  stereo_recheck: "Перепроверка по нескольким камерам", startup_prediction: "Прогноз начального трека",
+  stereo_recheck_prediction: "Прогноз проверенного трека", rejoining: "Возврат к измерениям", multi: "Триангуляция", mask_multi: "3D по сопровождению масок", mask_large: "3D по резервным маскам Large", cad_points: "3D по точкам CAD", cad_flow: "3D по движению области CAD", cad_region: "3D по видимому силуэту CAD", mono: "Одна камера", motion: "Движение и рёбра", flow: "Оптический поток", forecast: "Прогноз", lost: "Потеря"};
 const pad = {left: 51, right: 16, top: 13, bottom: 23};
 let data;
 let frames;
@@ -127,7 +130,7 @@ function drawChart() {
       : "Выберите точку графика или кадр в видео.";
   const value = frame => {
     if (axis === "speed") return frame.speed_kmh ?? null;
-    if (axis === "error") return frame.error_m ?? null;
+    if (axis === "error") return frame.error_m ?? frame.sample_error_m ?? null;
     return frame.xyz[axis] === null ? null : frame.xyz[axis] / 100;
   };
   const values = frames.map(value);
@@ -314,7 +317,8 @@ async function showSamples() {
       group.append(term, score);
       return group;
     });
-    const buttons = samples.map(({frame, difference_m, before_difference_m}) => {
+    const buttons = [...samples].sort((a, b) => (b.difference_m ?? -1) - (a.difference_m ?? -1))
+      .slice(0, 8).map(({frame, difference_m, before_difference_m}) => {
       const button = document.createElement("button");
       button.type = "button";
       const value = document.createElement("strong");
@@ -332,7 +336,7 @@ async function showSamples() {
       });
       return button;
     });
-    byId("sample-count").textContent = `С координатами ${integer.format(distances.length)} из ${integer.format(samples.length)} проверочных кадров`;
+    byId("sample-count").textContent = `${integer.format(distances.length)} проверочных кадров · выбраны 8 наибольших отклонений`;
     byId("sample-scores").replaceChildren(...scores);
     byId("sample-frames").replaceChildren(...buttons);
     byId("sample-metrics").hidden = false;
@@ -345,6 +349,7 @@ if (way2) {
   showScenes();
   byId("quality-note").hidden = false;
   byId("run-report").hidden = false;
+  document.querySelectorAll("[data-way2-download]").forEach(link => { link.hidden = false; });
   video.classList.add("way2");
 } else {
   fetch("/way2/", {method: "HEAD"}).then(response => {
@@ -364,14 +369,24 @@ replay.then(payload => {
   byId("speed").hidden = !hasSpeed;
   document.querySelector('[data-axis="speed"]').hidden = !hasSpeed;
   controls.hidden = false;
-  const {metrics, metadata} = data;
+  const {metadata} = data;
+  const metrics = data.metrics ?? (way2 ? data.reference_metrics : null);
+  const sampled = way2 && !data.metrics && Boolean(data.reference_metrics);
   byId("sequence-name").textContent = metadata.sequence ?? "Way1";
   byId("target-title").textContent = "Траектория в 3D · " + (metadata.object ?? "CargoTruck");
   document.querySelectorAll("[data-reference]").forEach(item => {
     item.hidden = !metrics && !(way2 && item.matches("article"));
     item.classList.toggle("unscored", !metrics);
   });
-  byId("reference-status").hidden = Boolean(metrics) || !way2;
+  byId("reference-status").hidden = !way2 || Boolean(data.metrics);
+  if (sampled) {
+    byId("reference-status").textContent = `По ${integer.format(metrics.n)} проверочным кадрам`;
+    byId("quality-note").textContent = `Точность по ${integer.format(metrics.n)} независимым контрольным точкам. Координаты выдаются на всех кадрах. Эталон для всего ролика отсутствует.`;
+    const details = document.querySelectorAll("article[data-reference] small");
+    const captions = ["Средний квадрат отклонения по проверочным точкам", "Среднее расстояние до проверочных точек",
+                      "Корень из MSE по проверочным точкам", "Наибольшее отклонение на проверенных кадрах"];
+    details.forEach((element, i) => { element.textContent = captions[i]; });
+  }
   if (metrics) {
     byId("mse").textContent = metrics.mse_m2 == null ? "—" : number.format(metrics.mse_m2) + " м²";
     byId("mae").textContent = metrics.mae_m == null ? "—" : number.format(metrics.mae_m) + " м";

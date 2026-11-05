@@ -31,3 +31,5 @@ python -m online.evaluate --out /path/to/results --reference /path/to/reference.
 Файл runtime задаёт каталоги дополнительных библиотек и кэша на Linux. Каталоги данных, весов и результатов хранятся отдельно от исходников.
 
 Полная инструкция находится в [docs/online.md](docs/online.md). Новые оценщики описаны в [docs/modernization.md](docs/modernization.md), проверенные метрики — в [docs/results.md](docs/results.md). История исходного решения сохранена в [docs/legacy-overview.md](docs/legacy-overview.md).
+
+Параметры опубликованного Way2 v6, CSV координат и ссылка на точный дополнительный checkpoint находятся в [submission/way2/README.md](submission/way2/README.md). Для Way2 приводятся метрики по независимым проверочным кадрам.

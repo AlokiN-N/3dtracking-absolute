@@ -1,0 +1,104 @@
+"""Заполнение провалов меняет только кадры без позы трекера и двигает ответ плавно."""
+from types import SimpleNamespace
+
+import numpy as np
+
+from online.estimation.gap_fill import GapFill, triangulate_pair
+from online.geometry import DEFAULT_TARGET
+from online.tracker import Estimate
+
+
+def make():
+    tracker = SimpleNamespace(current_views={}, groups={}, segmenter=None)
+    return tracker, GapFill(tracker, DEFAULT_TARGET, 30.0)
+
+
+def drive(fill, frames, step=0.3):
+    for i in range(frames):
+        fill.step(i, Estimate(np.array([step * i, 0.0, 3.0, 0.0, 0.0]), "multi", {}, 0.9), {})
+
+
+def test_tracker_pose_passes_through_unchanged():
+    _, fill = make()
+    estimate = Estimate(np.array([1.0, 2.0, 3.0, 0.1, 0.0]), "multi", {}, 0.9)
+    assert fill.step(0, estimate, {}) is estimate
+
+
+def test_gap_continues_recent_motion_on_the_road():
+    _, fill = make()
+    drive(fill, 30)
+    start = fill.pose[:3].copy()
+    out = [fill.step(30 + i, Estimate(None, "lost", {}, 0.0), {}) for i in range(30)]
+    assert all(e.status == "predicted" and e.pose is not None for e in out)
+    assert np.isclose(out[-1].pose[2], 3.0, atol=1e-6)            # высота дороги
+    moved = out[-1].pose[:3] - start
+    assert 8.5 < moved[0] < 9.5 and abs(moved[1]) < 1e-6           # 30 кадров × 0,3 м
+    steps = [np.linalg.norm(b.pose[:3] - a.pose[:3]) for a, b in zip(out, out[1:])]
+    assert max(steps) < 0.31
+
+
+def test_first_filled_frame_continues_tracker_answer():
+    _, fill = make()
+    drive(fill, 30)
+    last = fill.pose[:3].copy()
+    first = fill.step(30, Estimate(None, "lost", {}, 0.0), {})
+    assert np.linalg.norm(first.pose[:3] - last) < 0.31            # без скачка на входе в провал
+
+
+def test_step_is_limited():
+    _, fill = make()
+    drive(fill, 5, step=0.0)
+    before = fill.pose[:3].copy()
+    fill.x[:2] += 50.0                                             # фильтр «увидел» машину далеко
+    out = fill.step(5, Estimate(None, "lost", {}, 0.0), {})
+    assert np.isclose(np.linalg.norm(out.pose[:3] - before), fill.step_limit())
+
+
+def test_triangulation_of_two_rays():
+    a = (np.array([0.0, 0.0, 10.0]), np.array([1.0, 0.0, -0.1]) / np.linalg.norm([1.0, 0.0, -0.1]))
+    target = np.array([100.0, 0.0, 0.0])
+    origin = np.array([0.0, 100.0, 10.0])
+    b = (origin, (target - origin) / np.linalg.norm(target - origin))
+    point, gap = triangulate_pair(a, b)
+    assert np.allclose(point, target, atol=1e-6) and gap < 1e-6
+
+
+def test_nothing_known_stays_empty():
+    _, fill = make()
+    assert fill.step(0, Estimate(None, "lost", {}, 0.0), {}).pose is None
+
+
+def test_tracker_forecast_is_taken_over():
+    _, fill = make()
+    drive(fill, 30)
+    forecast = Estimate(np.array([500.0, 500.0, 3.0, 0.0, 0.0]), "forecast", {}, 0.0)
+    out = fill.step(30, forecast, {})
+    assert out.status == "predicted"                               # прогноз трекера заменён своим
+    assert np.linalg.norm(out.pose[:3] - np.array([9.0, 0.0, 3.0])) < 0.5
+
+
+def test_single_camera_pose_is_less_certain():
+    _, fill = make()
+    fill.step(0, Estimate(np.array([0.0, 0.0, 3.0, 0.0, 0.0]), "multi", {}, 0.9), {})
+    multi = np.sqrt(fill.P[0, 0])
+    fill.step(1, Estimate(np.array([0.0, 0.0, 3.0, 0.0, 0.0]), "mono", {}, 0.9), {})
+    assert np.sqrt(fill.P[0, 0]) > 4 * multi
+
+
+def test_guard_requires_recent_mask_and_consecutive_weak_proposals():
+    from online.estimation.gap_fill import GapFillGuard
+
+    guard = GapFillGuard(30, 42)
+    origin = np.zeros(5)
+    marker = object()
+    primary = Estimate(origin, "multi", {6: marker}, .9)
+    lost = Estimate(None, "lost", {}, 0., {6: marker})
+    blind = Estimate(origin, "predicted", {}, 0.)
+    weak = Estimate(origin + [.2, 0., 0., 0., 0.], "weak", {6: marker}, .8)
+    assert guard.step(0, primary, primary) is primary
+    assert guard.step(1, lost, blind) is lost
+    assert guard.step(2, lost, weak) is lost
+    assert guard.step(3, lost, weak) is weak
+    assert guard.step(4, Estimate(None, "lost", {}, 0.), weak).pose is None
+    assert guard.step(5, lost, weak) is lost
+    assert guard.step(46, lost, weak) is lost

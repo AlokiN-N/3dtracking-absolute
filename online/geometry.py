@@ -121,7 +121,7 @@ class Observation:
         confidence = min(1, magnitude / 4) * min(1, span / 12)
         return float(confidence * (forward @ self.movement) / (span * magnitude))
 
-    def overlap(self, pose):
+    def overlap(self, pose, *, visible_only=False):
         matrix = Rot(*pose[3:]).T
         rendered = np.zeros_like(self.mask)
         pixels, depth = self.view.project(self.view.model.vertices @ matrix + pose[:3])
@@ -133,6 +133,12 @@ class Observation:
             i += len(vertices)
             hull = cv2.convexHull(np.clip(np.round(q), -10000, 10000).astype(np.int32))
             cv2.fillConvexPoly(rendered, hull, 1)
+        if visible_only and self.clipped:
+            camera = self.view.camera
+            xs = np.arange(rendered.shape[1]) / self.ratio + self.origin[0]
+            ys = np.arange(rendered.shape[0]) / self.ratio + self.origin[1]
+            rendered[:, (xs < 0) | (xs > camera.width - 1)] = 0
+            rendered[(ys < 0) | (ys > camera.height - 1), :] = 0
         match = np.count_nonzero(rendered & self.mask)
         return match / max(np.count_nonzero(rendered | self.mask), 1)
 

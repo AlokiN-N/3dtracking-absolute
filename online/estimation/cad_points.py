@@ -65,6 +65,23 @@ def fit_points(prior, observation, tracks, model):
     return pose, overlap, precision
 
 
+def well_conditioned_stereo(pose, observations, model):
+    center = center_of(pose, model)
+    information = []
+    for observation in observations:
+        camera = observation.view.camera
+        offset = center - camera.loc / 100
+        distance = np.linalg.norm(offset)
+        if distance < 0.05:
+            continue
+        direction = offset / distance
+        noise_px = max(1.5, 0.003 * max(observation.size))
+        noise_m = distance * noise_px / camera.fpx
+        information.append((np.eye(3) - np.outer(direction, direction)) / noise_m**2)
+    limit = max(0.25, min(1.2, 0.09 * model.size))
+    return any(np.linalg.eigvalsh(a + b)[0] >= 1 / limit**2 for a, b in combinations(information, 2))
+
+
 class CadPointRecovery:
     """Keep independent camera tracks and never feed a recovered pose to the main tracker."""
 
@@ -107,22 +124,6 @@ class CadPointRecovery:
             if best is None or score > best[0]:
                 best = score, candidate
         return best[1] if best is not None else None
-
-    def stereo_geometry(self, pose, observations):
-        center = center_of(pose, self.model)
-        information = []
-        for observation in observations:
-            camera = observation.view.camera
-            offset = center - camera.loc / 100
-            distance = np.linalg.norm(offset)
-            if distance < 0.05:
-                continue
-            direction = offset / distance
-            noise_px = max(1.5, 0.003 * max(observation.size))
-            noise_m = distance * noise_px / camera.fpx
-            information.append((np.eye(3) - np.outer(direction, direction)) / noise_m**2)
-        limit = max(0.25, min(1.2, 0.09 * self.model.size))
-        return any(np.linalg.eigvalsh(a + b)[0] >= 1 / limit**2 for a, b in combinations(information, 2))
 
     def match_points(self, frame, key, observation, image):
         if self.last_measured is None:
@@ -183,7 +184,7 @@ class CadPointRecovery:
         candidates = []
         accepted = [observations[key] for key in estimate.views if key in observations]
         stereo = (estimate.status in {"multi", "mask_multi"} and estimate.confidence >= 0.42
-                  and self.stereo_geometry(estimate.pose, accepted))
+                  and well_conditioned_stereo(estimate.pose, accepted, self.model))
         strong_stereo = estimate.status == "multi" and estimate.confidence >= 0.62
         for key, observation in observations.items():
             anchor = self.anchors.get(key)

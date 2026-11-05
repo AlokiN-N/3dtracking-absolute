@@ -16,7 +16,7 @@ else:
 MAX_FRAMES = 120
 
 
-def handler(assets, output, reference=None, way2=None):
+def handler(assets, output, reference=None, way2=None, way2_assets=None):
     public = {"/": assets / "index.html"}
     for name in ("index.html", "style.css", "viewer.js"):
         public[f"/{name}"] = assets / name
@@ -24,8 +24,13 @@ def handler(assets, output, reference=None, way2=None):
         public[f"/{name}"] = output / name
     smoothing = {"/api/smooth": (output, reference)}
     if way2 is not None:
-        public["/way2/"] = assets / "index.html"
-        for name in ("control.mp4", "replay.json", "trajectory.csv", "report.json", "quality-samples.json"):
+        scene_assets = way2_assets if way2_assets is not None else assets
+        public["/way2/"] = scene_assets / "index.html"
+        for name in ("index.html", "style.css", "viewer.js"):
+            public[f"/way2/{name}"] = scene_assets / name
+        for name in ("control.mp4", "replay.json", "trajectory.csv", "report.json", "quality-samples.json",
+                     "metrics.json", "Way2-coordinates.csv", "3dtracking-absolute-way2.zip",
+                     "precision-yolo26l-seg.pt"):
             public[f"/way2/{name}"] = way2 / name
         smoothing["/way2/api/smooth"] = (way2, None)
 
@@ -140,10 +145,11 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--reference", type=Path, help="Reference positions for interactive metrics (CSV or JSON)")
     parser.add_argument("--way2", type=Path, help="Optional directory containing the Way2 diagnostic replay")
+    parser.add_argument("--way2-assets", type=Path, help="Optional assets used only by the Way2 page")
     args = parser.parse_args()
     assets = Path(__file__).resolve().parent.parent / "web"
     reference = smooth.load_reference(args.reference) if args.reference else None
-    with ThreadingHTTPServer(("127.0.0.1", args.port), handler(assets, args.out, reference, args.way2)) as server:
+    with ThreadingHTTPServer(("127.0.0.1", args.port), handler(assets, args.out, reference, args.way2, args.way2_assets)) as server:
         print(f"http://127.0.0.1:{args.port}", flush=True)
         server.serve_forever()
 
