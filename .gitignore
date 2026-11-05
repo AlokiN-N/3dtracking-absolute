@@ -1,0 +1,12 @@
+# данные не версионируются (архив лежит вне репозитория)
+data/
+out/
+.venv/
+__pycache__/
+*.pyc
+models/
+vendor/
+runtime/
+.cache/
+.venv-*/
+configs/*.local.json

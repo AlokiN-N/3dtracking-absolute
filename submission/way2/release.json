@@ -1,0 +1,66 @@
+{
+  "release": "way2-v6-refined",
+  "tracking_commit": "4f24964147f92afc6e6eb1ff2d082e39967d1a88",
+  "k": 0,
+  "sequence": "Way2",
+  "coordinate_units": "cm",
+  "frame_count": 1933,
+  "auxiliary_weights": {
+    "url": "https://plane.tail6ffd57.ts.net:8443/way2/precision-yolo26l-seg.pt",
+    "sha256": "c7c242a00276778bcab6fb6fd4bedaf5172c55acc4c44245b0d7aa14a14a3c66",
+    "bytes": 63695877,
+    "training_scene": "Way1"
+  },
+  "primary_weights": "yolo26l-seg.pt",
+  "sam_video": "facebook/sam2.1-hiera-base-plus",
+  "sam_video_reserve": "facebook/sam2.1-hiera-large",
+  "reference_frames": 217,
+  "full_ground_truth": false,
+  "coordinates_sha256": "c6a7bab70d58ee27f939cadca9c3822a2ad584e3111cefbc00b32ef7ae8339cd",
+  "sample_metrics": {
+    "all_reference_217": {
+      "n": 217,
+      "mae_m": 1.991427812109109,
+      "mse_m2": 20.99571966483591,
+      "rmse_m": 4.582108648301119,
+      "max_m": 19.396466293496168
+    },
+    "reference_179": {
+      "n": 179,
+      "mae_m": 0.8351188193221875,
+      "mse_m2": 1.1038281159148482,
+      "rmse_m": 1.0506322458000459,
+      "max_m": 4.363633178250202
+    },
+    "matched_159": {
+      "n": 159,
+      "mae_m": 0.8449908945588726,
+      "mse_m2": 1.1662824404522196,
+      "rmse_m": 1.0799455729119962,
+      "max_m": 4.363633178250202
+    },
+    "matched_197": {
+      "n": 197,
+      "mae_m": 2.116787405095766,
+      "mse_m2": 23.065608337830138,
+      "rmse_m": 4.802666794378946,
+      "max_m": 19.396466293496168
+    },
+    "startup_20": {
+      "n": 20,
+      "mae_m": 0.7566358211905408,
+      "mse_m2": 0.6073162358427455,
+      "rmse_m": 0.7793049697279913,
+      "max_m": 1.1952010588971884
+    },
+    "extra_38": {
+      "n": 38,
+      "mae_m": 7.4382517518159235,
+      "mse_m2": 114.69699827685882,
+      "rmse_m": 10.709668448502914,
+      "max_m": 19.396466293496168
+    }
+  },
+  "jumps_over_10_m": 4,
+  "maximum_step_m": 25.02045243307301
+}

@@ -1,0 +1,7 @@
+{
+  "site_packages": [
+    "/mnt/shared-data/peleng-hackathon/runtime/modern",
+    "/mnt/shared-data/peleng-hackathon/runtime/neural/lib/python3.13/site-packages"
+  ],
+  "cache": "/mnt/shared-data/peleng-hackathon/cache"
+}

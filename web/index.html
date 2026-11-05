@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#11151b">
+<title>Пеленг · 3D-трекинг</title>
+<link rel="stylesheet" href="style.css">
+<script src="viewer.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <nav id="scenes" class="downloads" aria-label="Выбор сцены" hidden>
+      <a id="way1-link" href="/">Way1</a>
+      <a id="way2-link" href="/way2/">Way2</a>
+    </nav>
+    <div class="eyebrow"><span class="signal"></span> SPACE HACKATHON / <span id="sequence-name">3D TRACKING</span></div>
+    <h1 id="target-title">Траектория объекта в 3D</h1>
+    <p>Каждый результат вычислен в порядке кадров по синхронным изображениям и состоянию трекера.</p>
+    <p id="quality-note" hidden>Для Way2 доступна проверка точности по отдельным кадрам. Эталонная траектория для всей сцены отсутствует. <a href="quality-samples.json">Данные проверки</a>.</p>
+  </header>
+  <section id="metrics" aria-labelledby="metrics-title">
+    <div class="section-head">
+      <h2 id="metrics-title">Метрики прогона</h2>
+      <span id="reference-status" class="label" hidden>Для точности по всему ролику нужен эталон</span>
+    </div>
+    <div class="metrics">
+    <article data-reference><span>MSE</span><strong id="mse">—</strong><small>Средний квадрат 3D-ошибки</small></article>
+    <article data-reference><span>MAE</span><strong id="mae">—</strong><small>Среднее расстояние до эталона</small></article>
+    <article data-reference><span>RMSE</span><strong id="rmse">—</strong><small id="rmse-detail">В абсолютной системе координат</small></article>
+    <article data-reference><span>Максимум</span><strong id="max-error">—</strong><small>Наибольшая 3D-ошибка</small></article>
+    <article class="metric-coverage"><span>Координаты выданы</span><strong id="coverage">—</strong><small id="covered">Доля кадров видео</small></article>
+    <article class="metric-coverage"><span>Кадры с наблюдениями</span><strong id="observed">—</strong><small>Трекер использовал данные хотя бы одной камеры</small></article>
+    </div>
+    <div id="sample-metrics" class="card" hidden>
+      <div class="section-head">
+        <h2>Расхождение с независимой оценкой</h2>
+        <span id="sample-count" class="label"></span>
+      </div>
+      <dl id="sample-scores" class="sample-frames"></dl>
+      <div id="sample-frames" class="sample-frames"></div>
+    </div>
+  </section>
+  <div class="layout">
+    <section class="card">
+      <div class="section-head"><h2>Контрольное видео</h2><span class="label">ПОВТОР</span></div>
+      <video id="video" controls preload="metadata" playsinline aria-label="Виды камер с наложенными рамками">
+        <source src="control.mp4" type="video/mp4">
+      </video>
+      <ul class="legend" aria-label="Цвета на видео">
+        <li><i></i> Зелёная рамка — проекция модели в камере с наблюдением. Зелёный контур — маска.</li>
+        <li><i class="amber"></i> Жёлтая рамка — проекция модели в камере без наблюдения.</li>
+        <li><i class="cyan"></i> Голубой контур — оценка по движению и рёбрам.</li>
+        <li id="mask-track-legend" hidden><i class="violet"></i> Сиреневый контур — сопровождение объекта в 2D.</li>
+      </ul>
+    </section>
+    <section class="card location">
+      <div class="section-head"><h2>Текущая оценка</h2><span class="label" id="mode">—</span></div>
+      <div class="frame" id="frame">Кадр —</div>
+      <dl>
+        <div><dt>X</dt><dd id="x">—</dd></div>
+        <div><dt>Y</dt><dd id="y">—</dd></div>
+        <div><dt>Z</dt><dd id="z">—</dd></div>
+      </dl>
+      <p id="speed" class="speed" hidden></p>
+      <p id="detail" class="quiet">Загрузка результатов</p>
+      <canvas id="map" aria-label="Вид траектории сверху в плоскости XY"></canvas>
+      <p id="lag-current" class="quiet lag-text" hidden></p>
+    </section>
+  </div>
+  <section class="card series">
+    <div class="section-head"><h2>Координаты по времени</h2><div class="tabs" aria-label="Выбор графика">
+      <button type="button" data-axis="0" aria-pressed="true">X</button>
+      <button type="button" data-axis="1" aria-pressed="false">Y</button>
+      <button type="button" data-axis="2" aria-pressed="false">Z</button>
+      <button type="button" data-axis="speed" aria-pressed="false" hidden>Скорость, км/ч</button>
+      <button type="button" data-axis="error" data-reference aria-pressed="false">Ошибка 3D</button>
+    </div></div>
+    <form id="lag-controls" class="lag-controls" aria-label="Параметры сглаживания" hidden>
+      <label for="lag-k">Задержка k, кадров
+        <input id="lag-k" type="number" min="0" max="120" step="1" value="5" required>
+      </label>
+      <label for="lag-history">Предыдущие кадры
+        <input id="lag-history" type="number" min="0" max="120" step="1" value="5" required disabled>
+      </label>
+      <label for="lag-method">Метод
+        <select id="lag-method">
+          <option value="linear">Линейная подгонка</option>
+          <option value="mean">Скользящее среднее</option>
+        </select>
+      </label>
+      <label class="lag-lock"><input id="lag-lock" type="checkbox" checked> Симметричное окно</label>
+      <p id="lag-status" class="quiet" role="status"></p>
+    </form>
+    <canvas id="chart" tabindex="0" aria-label="Клик выбирает кадр. Стрелки перемещают на один кадр."></canvas>
+    <p id="trajectory-legend" class="legend" hidden>
+      <span><i></i> Исходная траектория · k = 0</span>
+      <span><i class="orange"></i> <span id="lag-legend">Сглаженная траектория</span></span>
+    </p>
+    <p class="quiet" id="chart-note">Выберите точку графика или кадр в видео.</p>
+  </section>
+  <section id="lag-comparison" class="card series" hidden>
+    <div class="section-head"><h2>Сглаживание с фиксированной задержкой</h2><span id="lag-label" class="label lag-text"></span></div>
+    <p id="lag-summary" class="quiet"></p>
+    <table id="lag-metrics" hidden>
+      <caption id="lag-metrics-caption" class="quiet"></caption>
+      <thead><tr><th scope="col">Метрика</th><th scope="col">Причинная</th><th scope="col">Сглаженная</th></tr></thead>
+      <tbody>
+        <tr data-metric="mse_m2" data-unit="м²"><th scope="row">MSE</th><td></td><td></td></tr>
+        <tr data-metric="mae_m" data-unit="м"><th scope="row">MAE</th><td></td><td></td></tr>
+        <tr data-metric="rmse_m" data-unit="м"><th scope="row">RMSE</th><td></td><td></td></tr>
+        <tr data-metric="p95_m" data-unit="м"><th scope="row">P95</th><td></td><td></td></tr>
+        <tr data-metric="max_m" data-unit="м"><th scope="row">Максимальная ошибка</th><td></td><td></td></tr>
+      </tbody>
+    </table>
+  </section>
+  <footer>
+    <div id="run-info"></div>
+    <div class="downloads">
+      <a href="trajectory.csv" download>Координаты CSV</a>
+      <a href="metrics.json" data-reference download>Метрики JSON</a>
+      <a href="report.json" id="run-report" download hidden>Отчёт JSON</a>
+      <a href="Way2-coordinates.csv" data-way2-download download hidden>CSV для организаторов</a>
+      <a href="3dtracking-absolute-way2.zip" data-way2-download download hidden>Исходники ZIP</a>
+      <a id="lag-csv" download hidden>Сглаженные координаты CSV</a>
+      <a id="lag-json" download hidden>Сглаженные координаты и метрики JSON</a>
+    </div>
+  </footer>
+  <p id="error" class="error" hidden></p>
+</main>
+</body>
+</html>
